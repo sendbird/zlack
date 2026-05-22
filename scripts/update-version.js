@@ -21,9 +21,17 @@ console.log(`[Version Sync] Target version: ${version}`);
 // Update tauri.conf.json
 if (fs.existsSync(tauriConfPath)) {
     const tauriConf = JSON.parse(fs.readFileSync(tauriConfPath, 'utf8'));
-    if (tauriConf.package.version !== version) {
-        console.log(`[Version Sync] Updating tauri.conf.json from ${tauriConf.package.version} to ${version}`);
-        tauriConf.package.version = version;
+    const currentVersion = tauriConf.version ?? tauriConf.package?.version;
+
+    if (currentVersion !== version) {
+        console.log(`[Version Sync] Updating tauri.conf.json from ${currentVersion} to ${version}`);
+        if (tauriConf.version !== undefined) {
+            tauriConf.version = version;
+        } else if (tauriConf.package) {
+            tauriConf.package.version = version;
+        } else {
+            tauriConf.version = version;
+        }
         fs.writeFileSync(tauriConfPath, JSON.stringify(tauriConf, null, 2));
     } else {
         console.log(`[Version Sync] tauri.conf.json is already up to date.`);
