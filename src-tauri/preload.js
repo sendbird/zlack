@@ -536,16 +536,168 @@ function normalizeSlackInternalUrl(href) {
     return href;
 }
 
+function isSlackHost(hostname) {
+    return hostname === 'slack.com' || hostname.endsWith('.slack.com');
+}
+
+const ZOOM_EXTERNAL_PROTOCOLS = new Set(['zoommtg:', 'zoomus:', 'zoomphonecall:']);
+const originalWindowOpen = window.open.bind(window);
+
+function parseUrl(href) {
+    try {
+        return new URL(String(href), window.location.href);
+    } catch (error) {
+        console.error('Zlack: Failed to parse URL', error);
+        return null;
+    }
+}
+
+function isZoomProtocolUrl(url) {
+    return Boolean(url && ZOOM_EXTERNAL_PROTOCOLS.has(url.protocol));
+}
+
+function isZoomHost(hostname) {
+    return hostname === 'zoom.us' || hostname.endsWith('.zoom.us') || hostname === 'zoom.com' || hostname.endsWith('.zoom.com');
+}
+
+function isExternalHttpUrl(url) {
+    return Boolean((url.protocol === 'http:' || url.protocol === 'https:') && !isSlackHost(url.hostname));
+}
+
+function isZoomExternalUrl(url) {
+    return isZoomProtocolUrl(url) || ((url.protocol === 'http:' || url.protocol === 'https:') && isZoomHost(url.hostname));
+}
+
+function shouldOpenOutsideSlack(href) {
+    const url = parseUrl(href);
+    return Boolean(url && (isZoomExternalUrl(url) || isExternalHttpUrl(url)));
+}
+
+async function openExternalLink(href) {
+    const invoke = window.__TAURI__?.core?.invoke || window.__TAURI__?.invoke || window.__TAURI_INTERNALS__?.invoke;
+    if (typeof invoke === 'function') {
+        return invoke('open_external_url', { url: href });
+    }
+
+    const openExternal = window.__TAURI__?.shell?.open;
+    if (typeof openExternal === 'function') {
+        return openExternal(href);
+    }
+
+    originalWindowOpen(href, '_blank', 'noopener,noreferrer');
+}
+
+window.open = function(href, target, features) {
+    if (href && shouldOpenOutsideSlack(href)) {
+        const url = String(href);
+        console.log('Zlack: Intercepted external window.open:', url);
+        openExternalLink(url).catch((error) => {
+            console.error('Zlack: Failed to open external window.open via Tauri', error);
+            originalWindowOpen(url, '_blank', 'noopener,noreferrer');
+        });
+        return null;
+    }
+
+    return originalWindowOpen(href, target, features);
+};
+
+function getElementTarget(target) {
+    if (target instanceof Element) {
+        return target;
+    }
+
+    if (target instanceof Node) {
+        return target.parentElement;
+    }
+
+    return null;
+}
+
+function getNearbyZoomCardText(element) {
+    let current = element;
+    for (let depth = 0; current && depth < 8; depth += 1) {
+        const text = current.innerText || current.textContent || '';
+        if (text.length < 5000 && /(?:Zoom meeting|Meeting ID)/i.test(text)) {
+            return text;
+        }
+        current = current.parentElement;
+    }
+
+    return '';
+}
+
+function buildZoomJoinUrl(cardText) {
+    const meetingMatch = cardText.match(/Meeting\s+ID\s*:?\s*([0-9][0-9\s-]{6,}[0-9])/i);
+    if (!meetingMatch) {
+        return null;
+    }
+
+    const confno = meetingMatch[1].replace(/\D/g, '');
+    if (confno.length < 9) {
+        return null;
+    }
+
+    const passcodeMatch = cardText.match(/(?:Meeting\s+)?passcode\s*:?\s*([\s\S]*?)(?=To receive|\n|$)/i);
+    const passcode = passcodeMatch?.[1]?.trim().replace(/[.,;:]+$/, '');
+    const zoomUrl = new URL('zoommtg://zoom.us/join');
+    zoomUrl.searchParams.set('action', 'join');
+    zoomUrl.searchParams.set('confno', confno);
+    if (passcode) {
+        zoomUrl.searchParams.set('pwd', passcode);
+    }
+
+    return zoomUrl.toString();
+}
+
+function maybeHandleZoomJoinButtonClick(event) {
+    const target = getElementTarget(event.target);
+    if (!target || target.closest('a[href]')) {
+        return false;
+    }
+
+    const button = target.closest('button, [role="button"]');
+    if (!button) {
+        return false;
+    }
+
+    const buttonText = (button.innerText || button.textContent || button.getAttribute('aria-label') || button.getAttribute('title') || '').trim();
+    if (!/(?:^|\b)(join|참여|입장)(?:\b|$)/i.test(buttonText)) {
+        return false;
+    }
+
+    const cardText = getNearbyZoomCardText(button);
+    if (!cardText) {
+        return false;
+    }
+
+    const zoomUrl = buildZoomJoinUrl(cardText);
+    if (!zoomUrl) {
+        return false;
+    }
+
+    console.log('Zlack: Intercepted Zoom Join button:', zoomUrl);
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    openExternalLink(zoomUrl).catch((error) => {
+        console.error('Zlack: Failed to open Zoom Join URL via Tauri', error);
+        originalWindowOpen(zoomUrl, '_blank', 'noopener,noreferrer');
+    });
+    return true;
+}
+
 // 5. Intercept External Links
 document.addEventListener('click', (e) => {
-    const target = e.target.closest('a');
+    if (maybeHandleZoomJoinButtonClick(e)) {
+        return;
+    }
+
+    const eventTarget = getElementTarget(e.target);
+    const target = eventTarget?.closest('a');
     if (target && target.href) {
-        // Check if it's an external link (http/https) and NOT part of the Slack app itself
+        // Check if it's an external http(s) link and NOT part of Slack itself.
         const originalHref = target.href;
         const href = normalizeSlackInternalUrl(originalHref);
-        const isExternal = href.startsWith('http') && 
-                           !href.includes('app.slack.com') && 
-                           !href.includes('slack.com');
+        const isExternal = shouldOpenOutsideSlack(href);
 
         const opensInNewTab = target.target === '_blank';
         const isNormalizedInternalSlackLink = href !== originalHref;
@@ -553,16 +705,11 @@ document.addEventListener('click', (e) => {
         if (isExternal) {
             console.log("Zlack: Intercepted external link click:", href);
             e.preventDefault();
-            e.stopPropagation();
-            const openExternal = window.__TAURI__?.shell?.open;
-            if (typeof openExternal === 'function') {
-                openExternal(href).catch((error) => {
-                    console.error('Zlack: Failed to open external link via Tauri', error);
-                    window.open(href, '_blank');
-                });
-            } else {
-                window.open(href, '_blank');
-            }
+            e.stopImmediatePropagation();
+            openExternalLink(href).catch((error) => {
+                console.error('Zlack: Failed to open external link via Tauri', error);
+                originalWindowOpen(href, '_blank', 'noopener,noreferrer');
+            });
         } else if (opensInNewTab || isNormalizedInternalSlackLink) {
             // Internal Slack link meant for a new tab: keep it in this webview,
             // but do not manually assign window.location. Let Slack/default navigation
