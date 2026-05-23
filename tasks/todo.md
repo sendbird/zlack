@@ -350,3 +350,28 @@
 - Non-Slack `window.open`/new-window requests are denied in-webview after being handed to the OS opener.
 - `rtk cargo check --manifest-path src-tauri/Cargo.toml` passed; release binary/app bundle built, but DMG bundling failed after app generation, so the generated `.app` was installed directly for testing.
 - Installed rebuilt app to `/Applications/Zlack.app` and relaunched it.
+
+## 2026-05-22 Codex review: Windows Zoom opener escaping
+
+- [x] Reproduce/identify the Codex review finding for external URL opening.
+- [x] Replace Windows `cmd /C start` URL launch path with a shell-free opener so Zoom query strings keep `&` parameters intact.
+- [x] Clean up clippy warnings introduced in the branch diff.
+- [x] Validate Rust formatting, check, clippy, and tests.
+
+### Review / Results
+
+- Fixed Windows external URL launches by using `rundll32 url.dll,FileProtocolHandler <url>` instead of `cmd /C start`, avoiding shell parsing of Zoom URLs containing `&confno=...&pwd=...`.
+- Verification passed: `rtk cargo check --manifest-path src-tauri/Cargo.toml`, `rtk cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings`, and `rtk cargo test --manifest-path src-tauri/Cargo.toml`.
+
+## 2026-05-23 Shortcut diagnostic popup removal
+
+- [x] Locate shortcut diagnostic popup/notification paths.
+- [x] Remove injected DOM overlay from native shortcut execution.
+- [x] Remove physical shortcut fallback overlay while preserving fallback navigation.
+- [x] Validate JavaScript and Rust build.
+- [ ] Commit, open PR to main, and merge.
+
+### Review / Results
+
+- Removed shortcut diagnostic DOM overlays and the native shortcut-fired notification while keeping shortcut action execution and history fallback behavior intact.
+- Verification passed: `rtk node --check src-tauri/shortcut_actions.js` and `rtk cargo check --manifest-path src-tauri/Cargo.toml`.

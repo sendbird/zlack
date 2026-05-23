@@ -554,39 +554,9 @@ function handleZlackPhysicalShortcutFallback(event) {
     setZlackShortcutDetail('physical key fallback ' + event.key);
     if (event.key === '[') {
         window.history.back();
-        showZlackPhysicalShortcutOverlay('zlack_go_history_back', 'physical fallback history.back()');
     } else {
         window.history.forward();
-        showZlackPhysicalShortcutOverlay('zlack_go_history_forward', 'physical fallback history.forward()');
     }
-}
-
-function showZlackPhysicalShortcutOverlay(shortcutId, detail) {
-    const id = 'zlack-shortcut-diagnostic';
-    let overlay = document.getElementById(id);
-    if (!overlay) {
-        overlay = document.createElement('div');
-        overlay.id = id;
-        overlay.style.cssText = [
-            'position: fixed',
-            'z-index: 2147483647',
-            'top: 44px',
-            'right: 16px',
-            'max-width: 520px',
-            'padding: 12px 14px',
-            'border-radius: 10px',
-            'background: rgba(20, 20, 24, 0.94)',
-            'color: #fff',
-            'font: 12px/1.4 -apple-system, BlinkMacSystemFont, sans-serif',
-            'box-shadow: 0 8px 28px rgba(0, 0, 0, 0.36)',
-            'white-space: pre-wrap',
-            'pointer-events: none'
-        ].join(';');
-        document.documentElement.appendChild(overlay);
-    }
-    overlay.textContent = 'Zlack shortcut\n' + shortcutId + '\naction result: true\n' + detail + '\n' + window.location.href;
-    window.clearTimeout(window.__zlackShortcutDiagnosticTimer);
-    window.__zlackShortcutDiagnosticTimer = window.setTimeout(() => overlay.remove(), 5000);
 }
 
 if (!window.__zlackPhysicalShortcutFallbackInstalled) {

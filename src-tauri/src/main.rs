@@ -27,8 +27,7 @@ use core_graphics::window::{
     copy_window_info, kCGWindowAlpha, kCGWindowBounds, kCGWindowLayer,
     kCGWindowListExcludeDesktopElements, kCGWindowListOptionIncludingWindow,
     kCGWindowListOptionOnScreenAboveWindow, kCGWindowListOptionOnScreenOnly, kCGWindowNumber,
-    kCGWindowOwnerPID,
-    CGWindowID,
+    kCGWindowOwnerPID, CGWindowID,
 };
 #[cfg(target_os = "macos")]
 use objc2::{msg_send, runtime::AnyObject};
@@ -36,7 +35,8 @@ use tauri::{
     menu::{Menu, MenuBuilder, MenuItem, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     utils::config::BackgroundThrottlingPolicy,
-    Manager, Theme, TitleBarStyle, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
+    Manager, Theme, TitleBarStyle, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+    WindowEvent,
 };
 #[cfg(not(target_os = "windows"))]
 use tauri_plugin_notification::NotificationExt;
@@ -98,9 +98,9 @@ fn is_zoom_url(url: &Url) -> bool {
     matches!(url.scheme(), "zoommtg" | "zoomus" | "zoomphonecall")
         || ((url.scheme() == "http" || url.scheme() == "https")
             && (matches!(url.host_str(), Some("zoom.us") | Some("zoom.com"))
-                || url.host_str().is_some_and(|host| {
-                    host.ends_with(".zoom.us") || host.ends_with(".zoom.com")
-                })))
+                || url
+                    .host_str()
+                    .is_some_and(|host| host.ends_with(".zoom.us") || host.ends_with(".zoom.com"))))
 }
 
 fn is_allowed_external_url(url: &str) -> bool {
@@ -108,7 +108,10 @@ fn is_allowed_external_url(url: &str) -> bool {
         return false;
     };
 
-    matches!(parsed.scheme(), "http" | "https" | "zoommtg" | "zoomus" | "zoomphonecall")
+    matches!(
+        parsed.scheme(),
+        "http" | "https" | "zoommtg" | "zoomus" | "zoomphonecall"
+    )
 }
 
 fn open_external_url_with_os(url: &str) -> Result<(), String> {
@@ -125,8 +128,8 @@ fn open_external_url_with_os(url: &str) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     let mut command = {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "start", "", url]);
+        let mut command = Command::new("rundll32");
+        command.args(["url.dll,FileProtocolHandler", url]);
         command
     };
 
@@ -265,14 +268,6 @@ fn toggle_window_maximize(window: WebviewWindow) {
 fn run_slack_action_shortcut(app: &tauri::AppHandle, shortcut_id: &str) {
     eprintln!("Zlack: menu shortcut fired: {shortcut_id}");
 
-    #[cfg(not(target_os = "windows"))]
-    let _ = app
-        .notification()
-        .builder()
-        .title("Zlack shortcut fired")
-        .body(shortcut_id)
-        .show();
-
     let Some(window) = app.get_webview_window("main") else {
         eprintln!("Zlack: no main webview window for shortcut: {shortcut_id}");
         return;
@@ -282,42 +277,12 @@ fn run_slack_action_shortcut(app: &tauri::AppHandle, shortcut_id: &str) {
         r#"
         (() => {{
             const shortcutId = '{shortcut}';
-            function showZlackShortcutDiagnostic(stage, detail) {{
-                const id = 'zlack-shortcut-diagnostic';
-                let overlay = document.getElementById(id);
-                if (!overlay) {{
-                    overlay = document.createElement('div');
-                    overlay.id = id;
-                    overlay.style.cssText = [
-                        'position: fixed',
-                        'z-index: 2147483647',
-                        'top: 44px',
-                        'right: 16px',
-                        'max-width: 520px',
-                        'padding: 12px 14px',
-                        'border-radius: 10px',
-                        'background: rgba(20, 20, 24, 0.94)',
-                        'color: #fff',
-                        'font: 12px/1.4 -apple-system, BlinkMacSystemFont, sans-serif',
-                        'box-shadow: 0 8px 28px rgba(0, 0, 0, 0.36)',
-                        'white-space: pre-wrap',
-                        'pointer-events: none'
-                    ].join(';');
-                    document.documentElement.appendChild(overlay);
-                }}
-                overlay.textContent = 'Zlack shortcut\n' + shortcutId + '\n' + stage + '\n' + detail;
-                window.clearTimeout(window.__zlackShortcutDiagnosticTimer);
-                window.__zlackShortcutDiagnosticTimer = window.setTimeout(() => overlay.remove(), 5000);
-            }}
 
-            showZlackShortcutDiagnostic('eval reached', window.location.href);
             try {{
                 {runner}
                 const result = runZlackSlackShortcutAction(shortcutId);
-                showZlackShortcutDiagnostic('action result: ' + result, window.location.href);
                 console.log('Zlack shortcut result', {{ shortcutId, result, href: window.location.href }});
             }} catch (error) {{
-                showZlackShortcutDiagnostic('exception', error && (error.stack || error.message || String(error)));
                 console.error('Zlack shortcut exception', shortcutId, error);
             }}
         }})();
@@ -685,11 +650,22 @@ fn is_macos_window_materially_visible_by_full_window_list(
             .filter(|(_, entry)| {
                 entry.owner_pid == Some(current_pid)
                     && entry.layer == 0
-                    && entry.bounds.as_ref().is_some_and(MacosWindowBounds::is_material)
+                    && entry
+                        .bounds
+                        .as_ref()
+                        .is_some_and(MacosWindowBounds::is_material)
             })
             .max_by(|(_, left), (_, right)| {
-                let left_area = left.bounds.as_ref().map(macos_window_bounds_area).unwrap_or(0.0);
-                let right_area = right.bounds.as_ref().map(macos_window_bounds_area).unwrap_or(0.0);
+                let left_area = left
+                    .bounds
+                    .as_ref()
+                    .map(macos_window_bounds_area)
+                    .unwrap_or(0.0);
+                let right_area = right
+                    .bounds
+                    .as_ref()
+                    .map(macos_window_bounds_area)
+                    .unwrap_or(0.0);
                 left_area.total_cmp(&right_area)
             })
             .map(|(index, _)| index);
@@ -704,7 +680,9 @@ fn is_macos_window_materially_visible_by_full_window_list(
 
     let blocker_bounds = entries[..target_index]
         .iter()
-        .filter(|entry| entry.layer == 0 && entry.alpha > MATERIAL_VISIBILITY_BLOCKER_ALPHA_THRESHOLD)
+        .filter(|entry| {
+            entry.layer == 0 && entry.alpha > MATERIAL_VISIBILITY_BLOCKER_ALPHA_THRESHOLD
+        })
         .filter_map(|entry| entry.bounds)
         .filter(MacosWindowBounds::is_material)
         .collect::<Vec<_>>();
@@ -828,18 +806,17 @@ fn cg_window_bounds(dictionary: CFDictionaryRef) -> Option<MacosWindowBounds> {
 #[cfg(target_os = "macos")]
 fn cg_bounds_value(dictionary: CFDictionaryRef, key: &str) -> Option<f64> {
     let key = CFString::new(key);
-    cg_dictionary_number_value(dictionary, key.as_CFTypeRef())
-        .and_then(|number| cf_number_to_f64(number))
+    cg_dictionary_number_value(dictionary, key.as_CFTypeRef()).and_then(cf_number_to_f64)
 }
 
 #[cfg(target_os = "macos")]
 fn cg_window_i32(dictionary: CFDictionaryRef, key: CFTypeRef) -> Option<i32> {
-    cg_dictionary_number_value(dictionary, key).and_then(|number| cf_number_to_i32(number))
+    cg_dictionary_number_value(dictionary, key).and_then(cf_number_to_i32)
 }
 
 #[cfg(target_os = "macos")]
 fn cg_window_f64(dictionary: CFDictionaryRef, key: CFTypeRef) -> Option<f64> {
-    cg_dictionary_number_value(dictionary, key).and_then(|number| cf_number_to_f64(number))
+    cg_dictionary_number_value(dictionary, key).and_then(cf_number_to_f64)
 }
 
 #[cfg(target_os = "macos")]
