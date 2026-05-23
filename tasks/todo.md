@@ -207,3 +207,146 @@
 - `Cmd+Shift+T` no longer calls hard navigation; if the Threads sidebar/menu item is not found, it returns false instead of refreshing Slack.
 - Validation passed: `rtk cargo check --manifest-path src-tauri/Cargo.toml` and `rtk cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings`.
 - Release build installed to `/Applications/Zlack.app` and relaunched.
+
+## 2026-05-22 External HTTP link browser fix
+
+- [x] Locate Slack link interception in `src-tauri/preload.js`.
+- [x] Replace string-contains Slack detection with parsed hostname detection.
+- [x] Open external http(s) links through Tauri shell invoke so the OS default browser handles them.
+- [x] Run JavaScript syntax validation.
+- [x] Run Rust build validation.
+- [x] Review results.
+
+### Review / Results
+
+- External http(s) links now call Tauri shell `open` via `window.__TAURI_INTERNALS__.invoke('plugin:shell|open', ...)` when the global shell helper is unavailable, so the OS default browser handles them.
+- Slack-owned hosts remain inside the Zlack webview, using parsed hostname checks instead of broad substring matching.
+- Validation passed: `rtk node --check src-tauri/preload.js` and `rtk cargo check --manifest-path src-tauri/Cargo.toml`.
+
+## 2026-05-22 macOS occlusion memory saver
+
+- [x] Inspect current Rust memory saver scheduling.
+- [x] Add short hidden/minimized and occluded destroy delays.
+- [x] Gate delayed destroys on final effective visibility using macOS NSWindow occlusion state.
+- [x] Run `rtk cargo check --manifest-path src-tauri/Cargo.toml`.
+- [x] Review results.
+
+### Review / Results
+
+- Set hidden/minimized and occluded memory-saver delays to 3 minutes with a final effective-visibility check before destroying the Slack webview.
+- macOS uses NSWindow `occlusionState`; visibility-check errors are treated conservatively as visible.
+- Verification passed: `rtk cargo check --manifest-path src-tauri/Cargo.toml`.
+
+
+## 2026-05-22 Occlusion memory saver polling
+
+- Event-only occlusion handling missed covered-window cases when no focus, hide, or minimize event armed the destroy timer.
+- Added periodic effective-visibility polling so an occluded main window destroys WebContent after 3 continuous minutes.
+
+## 2026-05-22 macOS covered-window visibility
+
+- [x] Confirm `NSWindow.occlusionState` alone did not catch Zlack being covered by another app.
+- [x] Add `CGWindowListCopyWindowInfo` coverage sampling so higher z-order layer-0 windows can mark the main window materially covered.
+- [x] Run `rtk cargo check --manifest-path /Users/jinku/sendbird/zlack/src-tauri/Cargo.toml`.
+- [x] Review results.
+
+### Review / Results
+
+- Added CoreGraphics window-list coverage sampling because `NSWindow.occlusionState` alone did not detect Zlack covered by another app.
+- Verification passed: `rtk cargo check --manifest-path /Users/jinku/sendbird/zlack/src-tauri/Cargo.toml`.
+## 2026-05-22 macOS relative window coverage detection
+
+- [x] Update CGWindowList coverage detection to query blockers with `kCGWindowListOptionOnScreenAboveWindow` relative to Zlack's window number.
+- [x] Run `rtk cargo check --manifest-path /Users/jinku/sendbird/zlack/src-tauri/Cargo.toml`.
+
+### Review / Results
+
+- Coverage detection now uses target-window bounds plus `kCGWindowListOptionOnScreenAboveWindow` blockers relative to Zlack's window number.
+- Verification passed with `rtk cargo check --manifest-path /Users/jinku/sendbird/zlack/src-tauri/Cargo.toml`.
+
+## 2026-05-22 macOS covered-window PID fallback
+
+- Added PID-based fallback for CGWindow matching when `NSWindow.windowNumber` does not resolve to a usable CGWindow target or relative blockers are unavailable.
+
+## 2026-05-22 Zoom Join external open fix
+
+- [x] Add Zoom URL/protocol detection helpers in `src-tauri/preload.js`.
+- [x] Wrap `window.open` so Zoom and safe external HTTP(S) links open through the OS while Slack internal links stay in-webview.
+- [x] Add a focused capture-click fallback for Slack Zoom app card Join buttons that builds a `zoommtg://` join URL from nearby meeting details.
+- [x] Validate JavaScript syntax and Rust build.
+- [x] Review results.
+
+### Review / Results
+
+- Zoom protocols and Zoom web hosts now route through Tauri shell open, allowing the native Zoom app to claim meeting links.
+- Slack internal links continue to use the existing normalization/current-webview behavior.
+- Verification passed: `rtk node --check /Users/jinku/sendbird/zlack/src-tauri/preload.js` and `rtk cargo check --manifest-path /Users/jinku/sendbird/zlack/src-tauri/Cargo.toml`.
+
+## 2026-05-22 Zoom Slack card visible join button
+
+- [x] Inspect existing Zoom link/button interception in `src-tauri/preload.js`.
+- [x] Add a visible fallback Join Zoom button when Slack renders the Zoom app card action as an invisible/skeleton area.
+- [x] Reuse existing external-open flow so the fallback opens the native Zoom app.
+- [x] Validate JavaScript syntax and Rust build.
+- [x] Record review results.
+### Review / Results
+
+- Added a Slack DOM observer that detects Zoom cards with hidden Zoom links or meeting text and injects a visible `Join Zoom` button only when no visible join control exists.
+- The injected button reuses `openExternalLink`, so Zoom URLs still open through the OS/native Zoom flow instead of inside Slack.
+- Verification passed: `rtk node --check src-tauri/preload.js` and `rtk cargo check --manifest-path src-tauri/Cargo.toml`.
+
+## 2026-05-22 Revert intrusive Zoom card rendering hooks
+
+- [x] Remove global `window.open` wrapping because Slack app card rendering previously worked and the hook was too broad.
+- [x] Remove DOM observer/fallback button injection that tried to compensate for the broken Zoom card UI instead of preserving Slack's original rendering.
+- [x] Keep click-time external URL handling so actual Zoom/http links still open through the OS.
+- [x] Validate JavaScript syntax and Rust build.
+
+### Review / Results
+
+- Slack's original Zoom app-card rendering path is no longer modified by Zlack at render time.
+- External links are still handled only from the capture-phase click listener, reducing risk to Slack's message/card rendering lifecycle.
+- Verification passed: `rtk node --check src-tauri/preload.js` and `rtk cargo check --manifest-path src-tauri/Cargo.toml`.
+
+## 2026-05-22 Restore non-rendering Zoom open fix
+
+- [x] Keep intrusive Zoom card DOM/fallback button injection removed.
+- [x] Restore external `window.open` interception so Slack app-card buttons that open Zoom programmatically route through Tauri shell.
+- [x] Restore focused click fallback for visible Zoom Join buttons without anchors by constructing `zoommtg://` from nearby meeting text.
+- [x] Validate JavaScript syntax, Rust check, and release build.
+- [x] Reinstall and restart Zlack.
+
+### Review / Results
+
+- Fixed the current “button visible but click does nothing” case by handling non-anchor Zoom buttons again.
+- No render-time DOM observer or injected fallback button remains, so this should not alter Slack's card layout.
+- Verification passed: `rtk node --check src-tauri/preload.js`, `rtk cargo check --manifest-path src-tauri/Cargo.toml`, and `rtk npm run tauri build`.
+- Installed rebuilt app to `/Applications/Zlack.app` and relaunched it.
+
+## 2026-05-22 Reliable external URL opener
+
+- [x] Confirm rendered Zoom buttons were not blocked by layout changes; click path was the failure.
+- [x] Add Rust `open_external_url` command with scheme allowlist for http(s) and Zoom protocols.
+- [x] Update preload external opener to invoke the Rust command before plugin JS fallbacks.
+- [x] Validate JavaScript/Rust and rebuild/restart Zlack.
+
+### Review / Results
+
+- Replaced the silent JS shell-plugin dependency with an app-owned Tauri command that launches URLs via the OS opener.
+- Kept render-time DOM mutation disabled; only click-time open handling changed.
+- Verification passed: `rtk node --check src-tauri/preload.js`, `rtk cargo check --manifest-path src-tauri/Cargo.toml`, and `rtk npm run tauri build`.
+- Installed rebuilt app to `/Applications/Zlack.app` and relaunched it.
+
+## 2026-05-22 WebView-level Zoom URL interception
+
+- [x] Add Tauri WebView `on_navigation` hook to catch Zoom protocol/http URLs even if Slack bypasses preload click handlers.
+- [x] Add `on_new_window` hook to route non-Slack new-window requests through the OS opener.
+- [x] Reuse the Rust allowlisted external URL opener.
+- [x] Validate Rust check and install generated app bundle.
+
+### Review / Results
+
+- Zoom navigation now gets intercepted below JavaScript/preload, at the Tauri WebView level.
+- Non-Slack `window.open`/new-window requests are denied in-webview after being handed to the OS opener.
+- `rtk cargo check --manifest-path src-tauri/Cargo.toml` passed; release binary/app bundle built, but DMG bundling failed after app generation, so the generated `.app` was installed directly for testing.
+- Installed rebuilt app to `/Applications/Zlack.app` and relaunched it.
