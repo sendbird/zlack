@@ -323,6 +323,22 @@
 - Verification passed: `rtk node --check src-tauri/preload.js`, `rtk cargo check --manifest-path src-tauri/Cargo.toml`, and `rtk npm run tauri build`.
 - Installed rebuilt app to `/Applications/Zlack.app` and relaunched it.
 
+## 2026-05-27 Remove hidden WebView destroy memory saver
+
+- [x] Update requirement: do not destroy/recreate Slack WebView after it is hidden or occluded for ~3 minutes.
+- [x] Remove delayed memory-saver destroy timers and occlusion monitor from `src-tauri/src/main.rs`.
+- [x] Keep only WebView background throttling by using `BackgroundThrottlingPolicy::Throttle`.
+- [x] Validate Rust build and install rebuilt app to `/Applications/Zlack.app`.
+- [x] Review results.
+
+### Review / Results
+
+- Removed app-owned hidden/occluded WebView unload behavior: no more 3-minute `window.destroy()` timer, no occlusion polling thread, and no delayed destroy scheduling on close/minimize/focus loss.
+- Changed background throttling from `Disabled` to `Throttle`, so a hidden/background WebView is slowed but not fully suspended or destroyed.
+- Remaining behavior: closing from the window/menu still hides the window; reopening restores the same WebView instead of reloading Slack.
+- Verification passed: `rtk cargo fmt --manifest-path src-tauri/Cargo.toml --check`, `rtk cargo check --manifest-path src-tauri/Cargo.toml`, and `rtk npm run tauri build`.
+- Installed rebuilt app to `/Applications/Zlack.app` and relaunched it.
+
 ## 2026-05-22 Reliable external URL opener
 
 - [x] Confirm rendered Zoom buttons were not blocked by layout changes; click path was the failure.
@@ -375,3 +391,87 @@
 
 - Removed shortcut diagnostic DOM overlays and the native shortcut-fired notification while keeping shortcut action execution and history fallback behavior intact.
 - Verification passed: `rtk node --check src-tauri/shortcut_actions.js` and `rtk cargo check --manifest-path src-tauri/Cargo.toml`.
+
+## 2026-05-26 Slack attachment send failure fix
+
+- [x] Correct diagnosis: failure occurs after Slack UI file selection, not at the picker/menu entry point.
+- [x] Remove the temporary native Attach File menu change.
+- [x] Remove the unconditional fake `navigator.serviceWorker` implementation so Slack can use native Service Worker behavior or detect real absence.
+- [x] Validate JavaScript syntax and Rust build.
+- [x] Review results.
+
+### Review / Results
+
+- Removed the unconditional `navigator.serviceWorker` mock from `src-tauri/preload.js`. Slack now sees the real WebView Service Worker support instead of a fake object whose `ready` promise never resolves and whose `register()` always rejects.
+- Reverted the temporary native `File > Attach File…` menu change because the failing path is Slack's normal in-app `+` attachment flow.
+- Verification passed: `rtk node --check src-tauri/preload.js`, `rtk node --check src-tauri/shortcut_actions.js`, `rtk cargo fmt --manifest-path src-tauri/Cargo.toml --check`, `rtk cargo check --manifest-path src-tauri/Cargo.toml`, `rtk cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings`, and `rtk npm run tauri build`.
+
+## 2026-05-27 Slack file download button fix
+
+- [x] Investigate why uploaded file download buttons appear to do nothing.
+- [x] Confirm Tauri/Wry cancels WebKit download navigations on macOS when no download handler is registered.
+- [x] Add a main webview `on_download` handler that allows downloads and logs requested/finished events.
+- [x] Add overlay-button handling for Slack file URLs such as `https://sendbird.slack.com/files/...` opened through `window.open` or blank popup assignment.
+- [x] Add direct click fallback for non-anchor Slack download overlay buttons.
+- [x] Add Slack Desktop-like translucent Zlack download toast for fallback clicks and native download events.
+- [x] Validate JavaScript, Rust build, and release bundle.
+- [x] Review results.
+
+### Review / Results
+
+- Added `DownloadEvent` handling in `src-tauri/src/main.rs` so WebKit download requests are allowed instead of cancelled.
+- Added Slack file URL handling in `src-tauri/preload.js` for workspace file links like `https://sendbird.slack.com/files/...`, direct Slack file/CDN hosts, and blank-popup `window.open` flows used by overlay buttons.
+- Added a direct capture-phase fallback for non-anchor download overlay buttons: when a control labeled download or the leftmost file action is clicked, Zlack searches the nearby Slack file card for a file URL and starts the WebView download itself.
+- Added a Slack Desktop-like translucent in-app download toast in `src-tauri/preload.js`, plus a native `DownloadEvent` bridge from `src-tauri/src/main.rs` so Zlack visibly responds on both fallback-click and WebKit download paths.
+- Logs requested and finished download URLs to help distinguish future routing problems from successful downloads.
+- Verification passed: `rtk node --check src-tauri/preload.js`, `rtk cargo fmt --manifest-path src-tauri/Cargo.toml --check`, `rtk cargo check --manifest-path src-tauri/Cargo.toml`, `rtk cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings`, and `rtk npm run tauri build`.
+
+## 2026-05-27 Slack typing pane black render fix
+
+- [x] Investigate intermittent black Slack message pane where only the typing indicator remains visible.
+- [x] Identify WebView compositor suspension as the most likely cause for a virtualized Slack message list black layer.
+- [x] Change Slack WebView background throttling from `Suspend` to `Disabled`.
+- [x] Validate Rust build and release bundle.
+- [x] Review results.
+
+### Review / Results
+
+- Changed `create_main_window()` from `BackgroundThrottlingPolicy::Suspend` to `BackgroundThrottlingPolicy::Disabled` so Slack's virtualized/composited message pane is not suspended while the window is backgrounded or covered.
+- This trades a bit more background activity for avoiding stale black compositor layers where only the typing indicator repaints.
+- Verification passed: `rtk node --check src-tauri/preload.js`, `rtk cargo fmt --manifest-path src-tauri/Cargo.toml --check`, `rtk cargo check --manifest-path src-tauri/Cargo.toml`, `rtk cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings`, and `rtk npm run tauri build`.
+
+## 2026-05-27 PDF download/toast correction
+
+- [x] Correct the requirement: PDF file-card body clicks should keep Slack's viewer behavior; only explicit download controls should download.
+- [x] Remove the targeted PDF file-card body click interceptor from `src-tauri/preload.js`.
+- [x] Keep the smaller Slack-style toast.
+- [x] Prevent the toast's `View all downloads` button from being captured by the generic download-control interceptor.
+- [x] Change download kickoff from `_self` navigation to a hidden iframe target so viewer downloads do not show a redirect screen in the main WebView.
+- [x] Change `View all downloads` to open the OS Downloads folder in Finder and force Finder activation with `open -a Finder`.
+- [x] Build/relaunch/install Zlack from `/Applications/Zlack.app`.
+- [x] Review results.
+
+### Review / Results
+
+- Removed the PDF card/body click path so Slack can open the viewer from normal body clicks.
+- Reduced the toast from a large 704px-wide card to a compact 380px-wide translucent notification with smaller icon, copy, and link sizing.
+- Added a Tauri `open_downloads_folder` command and wired `View all downloads` to the local Downloads folder so the action opens Finder on macOS; the button is excluded from download-control interception and also stops propagation before calling the command.
+- Download kickoff now targets a hidden iframe instead of `_self`, avoiding visible redirect screens in the main Slack viewer route.
+- Verification passed: `rtk node --check src-tauri/preload.js`, `rtk cargo fmt --manifest-path src-tauri/Cargo.toml --check`, `rtk cargo check --manifest-path src-tauri/Cargo.toml`, and `rtk npm run tauri build`.
+- Installed rebuilt app to `/Applications/Zlack.app` and relaunched it.
+
+## 2026-05-27 Reveal downloaded file in Finder
+
+- [x] Update requirement: `View all downloads` should reveal and highlight the downloaded file, not only open the Downloads folder.
+- [x] Store the most recent download destination/path from Tauri download events.
+- [x] Change Finder opening to reveal the downloaded file when it exists, falling back to the Downloads folder otherwise.
+- [x] Build and install to `/Applications/Zlack.app`.
+- [x] Review results.
+
+### Review / Results
+
+- Added native tracking of the latest Tauri download path from `DownloadEvent::Requested` / `DownloadEvent::Finished`.
+- `View all downloads` now opens the latest completed download path through Finder `reveal`, which selects/highlights the file; if the file is missing or outside Downloads, it falls back to the Downloads folder.
+- Verification passed: `rtk cargo fmt --manifest-path src-tauri/Cargo.toml --check`, `rtk cargo check --manifest-path src-tauri/Cargo.toml`, and `rtk npm run tauri build`.
+- Installed rebuilt app to `/Applications/Zlack.app` and relaunched it.
+- Finder reveal command verified with a concrete file: Finder selection resolved to `/Users/jinku/Downloads/07242024-FSA.pdf`.
