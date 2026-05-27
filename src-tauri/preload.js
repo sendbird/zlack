@@ -1,27 +1,7 @@
 
 // Preload script to bridge Slack notifications to Tauri
 
-// 1. MOCK Service Workers
-if (window.navigator) {
-    const dummyServiceWorker = {
-        controller: null,
-        ready: new Promise(() => {}), // Never resolves
-        getRegistration: () => Promise.resolve(undefined),
-        register: () => Promise.reject(new Error("ServiceWorkers disabled in Zlack")),
-        addEventListener: () => {},
-        removeEventListener: () => {},
-        dispatchEvent: () => false,
-    };
-
-    Object.defineProperty(window.navigator, 'serviceWorker', {
-        get: function() {
-            return dummyServiceWorker;
-        },
-        configurable: true
-    });
-}
-
-// 2. Mock Permission API
+// 1. Mock Permission API
 const originalQuery = navigator.permissions.query;
 navigator.permissions.query = (parameters) => {
     if (parameters.name === 'notifications') {
@@ -36,7 +16,7 @@ navigator.permissions.query = (parameters) => {
 };
 
 
-// 2.5 Intercept Network Requests (Telemetry) for Notification Context
+// 2. Intercept Network Requests (Telemetry) for Notification Context
 let lastEventContext = { teamId: 'unknown', channelId: 'unknown' };
 window.__zlackLastEventContext = lastEventContext;
 
@@ -526,7 +506,7 @@ function normalizeSlackInternalUrl(href) {
             return permalinkUrl;
         }
 
-        if (url.pathname === '/app_redirect') {
+        if (url.pathname === '/app_redirect' || url.pathname.startsWith('/files/')) {
             return preventSlackNativeRedirect(url);
         }
     } catch (error) {
@@ -538,6 +518,28 @@ function normalizeSlackInternalUrl(href) {
 
 function isSlackHost(hostname) {
     return hostname === 'slack.com' || hostname.endsWith('.slack.com');
+}
+
+function isSlackFileHost(hostname) {
+    return hostname === 'slack-files.com'
+        || hostname.endsWith('.slack-files.com')
+        || hostname === 'slack-edge.com'
+        || hostname.endsWith('.slack-edge.com');
+}
+
+function isSlackFileUrl(url) {
+    if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:')) {
+        return false;
+    }
+
+    if (isSlackFileHost(url.hostname)) {
+        return true;
+    }
+
+    return isSlackHost(url.hostname)
+        && (url.pathname.startsWith('/files/')
+            || url.pathname.startsWith('/files-pri/')
+            || url.pathname.startsWith('/files-tmb/'));
 }
 
 const ZOOM_EXTERNAL_PROTOCOLS = new Set(['zoommtg:', 'zoomus:', 'zoomphonecall:']);
@@ -561,7 +563,9 @@ function isZoomHost(hostname) {
 }
 
 function isExternalHttpUrl(url) {
-    return Boolean((url.protocol === 'http:' || url.protocol === 'https:') && !isSlackHost(url.hostname));
+    return Boolean((url.protocol === 'http:' || url.protocol === 'https:')
+        && !isSlackHost(url.hostname)
+        && !isSlackFileHost(url.hostname));
 }
 
 function isZoomExternalUrl(url) {
@@ -587,14 +591,119 @@ async function openExternalLink(href) {
     originalWindowOpen(href, '_blank', 'noopener,noreferrer');
 }
 
-window.open = function(href, target, features) {
-    if (href && shouldOpenOutsideSlack(href)) {
-        const url = String(href);
-        console.log('Zlack: Intercepted external window.open:', url);
-        openExternalLink(url).catch((error) => {
+function startWebviewDownload(href) {
+    const frameName = 'zlack-download-frame';
+    let frame = document.getElementById(frameName);
+    if (!frame) {
+        frame = document.createElement('iframe');
+        frame.id = frameName;
+        frame.name = frameName;
+        frame.title = 'Zlack download target';
+        frame.style.display = 'none';
+        document.documentElement.appendChild(frame);
+    }
+
+    const link = document.createElement('a');
+    link.href = href;
+    link.download = '';
+    link.target = frameName;
+    link.rel = 'noopener';
+    link.style.display = 'none';
+    document.documentElement.appendChild(link);
+    link.click();
+    link.remove();
+
+    window.setTimeout(() => {
+        try {
+            frame.src = 'about:blank';
+        } catch (_) {}
+    }, 1500);
+}
+
+function handleWindowOpenUrl(href, fallbackTarget = '_blank', fallbackFeatures = 'noopener,noreferrer') {
+    const url = parseUrl(href);
+    if (!url) {
+        return false;
+    }
+
+    if (isSlackFileUrl(url)) {
+        const downloadUrl = normalizeSlackInternalUrl(url.toString());
+        console.log('Zlack: Starting Slack file download in current webview:', downloadUrl);
+        startWebviewDownload(downloadUrl);
+        showZlackDownloadToast({ filename: getFilenameFromUrl(downloadUrl), url: downloadUrl, status: 'downloading' });
+        return true;
+    }
+
+    if (shouldOpenOutsideSlack(url.toString())) {
+        const externalUrl = url.toString();
+        console.log('Zlack: Intercepted external window.open:', externalUrl);
+        openExternalLink(externalUrl).catch((error) => {
             console.error('Zlack: Failed to open external window.open via Tauri', error);
-            originalWindowOpen(url, '_blank', 'noopener,noreferrer');
+            originalWindowOpen(externalUrl, fallbackTarget, fallbackFeatures);
         });
+        return true;
+    }
+
+    return false;
+}
+
+function createDeferredWindowOpenProxy(target, features) {
+    let href = 'about:blank';
+    let closed = false;
+    const fallbackTarget = target || '_blank';
+    const fallbackFeatures = features || 'noopener,noreferrer';
+
+    const openAssignedUrl = (value) => {
+        href = String(value || 'about:blank');
+        if (href === 'about:blank') {
+            return;
+        }
+
+        if (!handleWindowOpenUrl(href, fallbackTarget, fallbackFeatures)) {
+            originalWindowOpen(href, fallbackTarget, fallbackFeatures);
+        }
+    };
+
+    const locationProxy = {
+        assign: openAssignedUrl,
+        replace: openAssignedUrl,
+        toString: () => href,
+    };
+
+    Object.defineProperty(locationProxy, 'href', {
+        get: () => href,
+        set: openAssignedUrl,
+        configurable: true,
+    });
+
+    return {
+        get closed() {
+            return closed;
+        },
+        close() {
+            closed = true;
+        },
+        focus() {},
+        blur() {},
+        document: {
+            write() {},
+            close() {},
+        },
+        get location() {
+            return locationProxy;
+        },
+        set location(value) {
+            openAssignedUrl(value);
+        },
+    };
+}
+
+window.open = function(href, target, features) {
+    if (!href || String(href) === 'about:blank') {
+        return createDeferredWindowOpenProxy(target, features);
+    }
+
+    if (handleWindowOpenUrl(href, target, features)) {
         return null;
     }
 
@@ -649,6 +758,440 @@ function buildZoomJoinUrl(cardText) {
     return zoomUrl.toString();
 }
 
+function getClickableControl(target) {
+    const element = getElementTarget(target);
+    return element?.closest('a[href], button, [role="button"], [tabindex]:not([tabindex="-1"])') || null;
+}
+
+function getControlDescriptor(element) {
+    if (!element) {
+        return '';
+    }
+
+    return [
+        element.textContent,
+        element.getAttribute('aria-label'),
+        element.getAttribute('title'),
+        element.getAttribute('data-qa'),
+        element.getAttribute('data-qa-tooltip'),
+        element.getAttribute('data-testid'),
+        element.getAttribute('aria-keyshortcuts'),
+    ].filter(Boolean).join(' ');
+}
+
+function isVisibleControl(element) {
+    if (!element) return false;
+    const rect = element.getBoundingClientRect();
+    if (rect.width < 12 || rect.height < 12) return false;
+    const style = window.getComputedStyle(element);
+    return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0.01;
+}
+
+function isLeftmostFileActionControl(element) {
+    const rect = element.getBoundingClientRect();
+    let current = element.parentElement;
+
+    for (let depth = 0; current && depth < 7; depth += 1) {
+        const controls = Array.from(current.querySelectorAll('a[href], button, [role="button"], [tabindex]:not([tabindex="-1"])'))
+            .filter(isVisibleControl)
+            .map((control) => ({ control, rect: control.getBoundingClientRect() }))
+            .filter(({ rect: candidateRect }) => Math.abs((candidateRect.top + candidateRect.bottom) / 2 - (rect.top + rect.bottom) / 2) < 12);
+
+        if (controls.length >= 2) {
+            controls.sort((a, b) => a.rect.left - b.rect.left);
+            return controls[0].control === element;
+        }
+
+        current = current.parentElement;
+    }
+
+    return false;
+}
+
+function isLikelySlackDownloadControl(element) {
+    const descriptor = getControlDescriptor(element);
+    return /download|다운로드|다운 받|다운받|저장/i.test(descriptor) || isLeftmostFileActionControl(element);
+}
+
+function getSlackFileUrlPriority(url) {
+    if (!isSlackFileUrl(url)) {
+        return -1;
+    }
+
+    const pathname = (url.pathname || '').toLowerCase();
+    const decodedPathname = (() => {
+        try {
+            return decodeURIComponent(pathname);
+        } catch (_) {
+            return pathname;
+        }
+    })();
+    const isPdf = /\.pdf(?:$|[/?#])/i.test(decodedPathname);
+
+    if (isSlackHost(url.hostname) && pathname.startsWith('/files/')) {
+        return 50;
+    }
+
+    if (isSlackFileHost(url.hostname) && isPdf) {
+        return 45;
+    }
+
+    if (isSlackHost(url.hostname) && pathname.startsWith('/files-pri/')) {
+        return 35;
+    }
+
+    if (isSlackFileHost(url.hostname)) {
+        return 30;
+    }
+
+    if (isSlackHost(url.hostname) && pathname.startsWith('/files-tmb/')) {
+        return 10;
+    }
+
+    return 20;
+}
+
+function findSlackFileUrlNear(element) {
+    const seen = new Set();
+    let bestCandidate = null;
+    let current = element;
+
+    for (let depth = 0; current && depth < 10; depth += 1) {
+        const candidates = [];
+        if (current.matches?.('a[href]')) {
+            candidates.push(current);
+        }
+        candidates.push(...Array.from(current.querySelectorAll?.('a[href]') || []));
+
+        for (const link of candidates) {
+            if (seen.has(link)) {
+                continue;
+            }
+            seen.add(link);
+
+            const url = parseUrl(link.href);
+            const priority = getSlackFileUrlPriority(url);
+            if (priority >= 0 && (!bestCandidate || priority > bestCandidate.priority)) {
+                bestCandidate = {
+                    priority,
+                    url: normalizeSlackInternalUrl(url.toString()),
+                };
+                if (priority >= 50) {
+                    return bestCandidate.url;
+                }
+            }
+        }
+
+        current = current.parentElement;
+    }
+
+    return bestCandidate?.url || null;
+}
+
+function getFilenameFromUrl(href) {
+    try {
+        const url = new URL(href, window.location.href);
+        const lastSegment = decodeURIComponent(url.pathname.split('/').filter(Boolean).pop() || 'file');
+        return lastSegment || 'file';
+    } catch (_) {
+        return 'file';
+    }
+}
+
+function getFileKindLabel(filename) {
+    const ext = String(filename || '').split('.').pop()?.toLowerCase();
+    const labels = {
+        pdf: 'PDF',
+        png: 'PNG image',
+        jpg: 'JPEG image',
+        jpeg: 'JPEG image',
+        gif: 'GIF image',
+        webp: 'WebP image',
+        mov: 'Video',
+        mp4: 'Video',
+        txt: 'Text',
+        md: 'Markdown',
+        json: 'JSON',
+        csv: 'CSV',
+        zip: 'Archive',
+    };
+    return labels[ext] || (ext ? ext.toUpperCase() : 'File');
+}
+
+function getFileIconLabel(filename) {
+    const ext = String(filename || '').split('.').pop()?.toLowerCase();
+    if (!ext) return '01';
+    if (ext === 'pdf') return 'PDF';
+    if (['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext)) return 'IMG';
+    if (['zip', 'gz', 'tar', 'rar', '7z'].includes(ext)) return 'ZIP';
+    return ext.slice(0, 3).toUpperCase();
+}
+
+async function openZlackDownloadsFolder() {
+    const fallbackUrl = 'zlack://open-downloads?source=toast&ts=' + Date.now();
+    try {
+        window.location.href = fallbackUrl;
+    } catch (error) {
+        console.error('Zlack: Failed to request Downloads folder via navigation', error);
+    }
+
+    const invoke = window.__TAURI__?.core?.invoke || window.__TAURI__?.invoke || window.__TAURI_INTERNALS__?.invoke;
+    let lastError = null;
+    if (typeof invoke === 'function') {
+        try {
+            await invoke('open_downloads_folder', {});
+            return;
+        } catch (error) {
+            lastError = error;
+            console.error('Zlack: Failed to open Downloads folder via command', error);
+        }
+    }
+
+    const openExternal = window.__TAURI__?.shell?.open;
+    const downloadDir = await window.__TAURI__?.path?.downloadDir?.().catch((error) => {
+        lastError = error;
+        console.error('Zlack: Failed to resolve Downloads folder', error);
+        return null;
+    });
+
+    if (typeof openExternal === 'function' && downloadDir) {
+        try {
+            await openExternal(downloadDir);
+            return;
+        } catch (error) {
+            lastError = error;
+        }
+    }
+
+    console.error('Zlack: No available path opened Downloads folder', lastError);
+}
+
+function showZlackDownloadToast(input) {
+    const payload = typeof input === 'object' && input !== null ? input : { filename: String(input || 'file') };
+    const filename = payload.filename || getFilenameFromUrl(payload.url || '') || 'file';
+    const status = payload.status || 'downloading';
+    const success = payload.success !== false;
+    const complete = status === 'finished';
+    const kind = payload.kind || getFileKindLabel(filename);
+    const iconLabel = getFileIconLabel(filename);
+
+    const existing = document.getElementById('zlack-download-toast');
+    existing?.remove();
+
+    const toast = document.createElement('div');
+    toast.id = 'zlack-download-toast';
+    toast.setAttribute('role', 'status');
+    toast.setAttribute('aria-live', 'polite');
+
+    const panel = document.createElement('div');
+    panel.className = 'zlack-download-toast-panel';
+
+    const card = document.createElement('div');
+    card.className = 'zlack-download-toast-card';
+
+    const icon = document.createElement('div');
+    icon.className = 'zlack-download-toast-icon';
+    icon.textContent = iconLabel;
+    if (iconLabel === 'PDF') icon.classList.add('is-pdf');
+
+    const badge = document.createElement('div');
+    badge.className = 'zlack-download-toast-badge';
+    badge.textContent = complete ? (success ? '✓' : '!') : '↓';
+    if (!success) badge.classList.add('is-error');
+    icon.appendChild(badge);
+
+    const copy = document.createElement('div');
+    copy.className = 'zlack-download-toast-copy';
+
+    const title = document.createElement('div');
+    title.className = 'zlack-download-toast-title';
+    title.textContent = filename;
+
+    const subtitle = document.createElement('div');
+    subtitle.className = 'zlack-download-toast-subtitle';
+    subtitle.textContent = complete ? (success ? kind : 'Download failed') : kind;
+
+    copy.append(title, subtitle);
+    card.append(icon, copy);
+
+    const downloads = document.createElement('button');
+    downloads.type = 'button';
+    downloads.className = 'zlack-download-toast-link';
+    downloads.textContent = 'View all downloads';
+    downloads.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        openZlackDownloadsFolder();
+    });
+
+    panel.append(card, downloads);
+    toast.append(panel);
+
+    const style = document.createElement('style');
+    style.textContent = [
+        '#zlack-download-toast {',
+        '  position: fixed;',
+        '  right: 28px;',
+        '  bottom: 84px;',
+        '  width: min(380px, calc(100vw - 56px));',
+        '  z-index: 2147483647;',
+        '  pointer-events: none;',
+        '  color: #f8f8f8;',
+        '  font-family: Slack-Lato, Slack-Averta, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;',
+        '  animation: zlackDownloadToastIn 180ms cubic-bezier(.2, .8, .2, 1);',
+        '}',
+        '#zlack-download-toast .zlack-download-toast-panel {',
+        '  box-sizing: border-box;',
+        '  width: 100%;',
+        '  padding: 12px 14px 14px;',
+        '  border: 1px solid rgba(232, 232, 232, .14);',
+        '  border-radius: 13px;',
+        '  background: rgba(35, 38, 42, .76);',
+        '  box-shadow: 0 14px 36px rgba(0, 0, 0, .32), inset 0 1px 0 rgba(255, 255, 255, .045);',
+        '  backdrop-filter: blur(18px) saturate(1.12);',
+        '  -webkit-backdrop-filter: blur(18px) saturate(1.12);',
+        '}',
+        '#zlack-download-toast .zlack-download-toast-card {',
+        '  display: grid;',
+        '  grid-template-columns: 42px minmax(0, 1fr);',
+        '  align-items: center;',
+        '  gap: 12px;',
+        '  min-height: 56px;',
+        '  width: 100%;',
+        '  padding: 8px 12px;',
+        '  border-radius: 10px;',
+        '  background: rgba(28, 24, 25, .88);',
+        '  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .025);',
+        '}',
+        '#zlack-download-toast .zlack-download-toast-icon {',
+        '  position: relative;',
+        '  display: grid;',
+        '  place-items: center;',
+        '  width: 42px;',
+        '  height: 42px;',
+        '  border-radius: 9px;',
+        '  background: linear-gradient(145deg, #6c6a6d, #4e4c50);',
+        '  color: #fff;',
+        '  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;',
+        '  font-size: 13px;',
+        '  font-weight: 800;',
+        '  letter-spacing: -.08em;',
+        '  overflow: visible;',
+        '}',
+        '#zlack-download-toast .zlack-download-toast-icon.is-pdf {',
+        '  background: linear-gradient(145deg, #ff2d6f, #df1457);',
+        '  font-size: 11px;',
+        '  letter-spacing: -.04em;',
+        '}',
+        '#zlack-download-toast .zlack-download-toast-badge {',
+        '  position: absolute;',
+        '  right: -5px;',
+        '  bottom: -5px;',
+        '  display: grid;',
+        '  place-items: center;',
+        '  width: 19px;',
+        '  height: 19px;',
+        '  border-radius: 999px;',
+        '  background: #f8f8f8;',
+        '  color: #1d1c1d;',
+        '  border: 2px solid rgba(28, 24, 25, .95);',
+        '  font-size: 12px;',
+        '  font-weight: 900;',
+        '  line-height: 1;',
+        '}',
+        '#zlack-download-toast .zlack-download-toast-badge.is-error { color: #e01e5a; }',
+        '#zlack-download-toast .zlack-download-toast-copy { min-width: 0; }',
+        '#zlack-download-toast .zlack-download-toast-title {',
+        '  overflow: hidden;',
+        '  text-overflow: ellipsis;',
+        '  white-space: nowrap;',
+        '  font-size: 14px;',
+        '  line-height: 18px;',
+        '  font-weight: 700;',
+        '  letter-spacing: -.02em;',
+        '  color: #fff;',
+        '}',
+        '#zlack-download-toast .zlack-download-toast-subtitle {',
+        '  margin-top: 3px;',
+        '  overflow: hidden;',
+        '  text-overflow: ellipsis;',
+        '  white-space: nowrap;',
+        '  font-size: 13px;',
+        '  line-height: 17px;',
+        '  font-weight: 500;',
+        '  color: rgba(255, 255, 255, .88);',
+        '}',
+        '#zlack-download-toast .zlack-download-toast-link {',
+        '  pointer-events: auto;',
+        '  margin: 9px 0 0 54px;',
+        '  padding: 0;',
+        '  border: 0;',
+        '  background: transparent;',
+        '  color: rgba(255, 255, 255, .94);',
+        '  font: inherit;',
+        '  font-size: 13px;',
+        '  line-height: 18px;',
+        '  font-weight: 500;',
+        '  text-align: left;',
+        '  cursor: pointer;',
+        '}',
+        '#zlack-download-toast .zlack-download-toast-link:hover { text-decoration: underline; }',
+        '@keyframes zlackDownloadToastIn {',
+        '  from { opacity: 0; transform: translateY(14px) scale(.985); }',
+        '  to { opacity: 1; transform: translateY(0) scale(1); }',
+        '}',
+    ].join('\n');
+    toast.appendChild(style);
+
+    document.documentElement.appendChild(toast);
+    window.clearTimeout(window.__zlackDownloadToastTimeout);
+    window.__zlackDownloadToastTimeout = window.setTimeout(() => toast.remove(), complete ? 7000 : 5000);
+}
+
+window.__zlackShowDownloadToast = showZlackDownloadToast;
+
+function triggerSlackFileDownload(downloadUrl, event, sourceLabel) {
+    if (!downloadUrl) {
+        return false;
+    }
+
+    const now = Date.now();
+    if (window.__zlackLastDownloadUrl === downloadUrl && now - (window.__zlackLastDownloadAt || 0) < 1200) {
+        event?.preventDefault();
+        event?.stopImmediatePropagation();
+        return true;
+    }
+    window.__zlackLastDownloadUrl = downloadUrl;
+    window.__zlackLastDownloadAt = now;
+
+    console.log(`Zlack: Intercepted Slack file ${sourceLabel}:`, downloadUrl);
+    event?.preventDefault();
+    event?.stopImmediatePropagation();
+    startWebviewDownload(downloadUrl);
+    showZlackDownloadToast({ filename: getFilenameFromUrl(downloadUrl), url: downloadUrl, status: 'downloading' });
+    return true;
+}
+
+function maybeHandleSlackFileDownloadButtonClick(event) {
+    const target = getElementTarget(event.target);
+    if (target?.closest('#zlack-download-toast')) {
+        return false;
+    }
+
+    const control = getClickableControl(event.target);
+    if (!control || !isLikelySlackDownloadControl(control)) {
+        return false;
+    }
+
+    const downloadUrl = findSlackFileUrlNear(control);
+    if (!downloadUrl) {
+        console.warn('Zlack: Slack download control clicked, but no nearby file URL was found', control);
+        return false;
+    }
+
+    return triggerSlackFileDownload(downloadUrl, event, 'download control');
+}
+
 function maybeHandleZoomJoinButtonClick(event) {
     const target = getElementTarget(event.target);
     if (!target || target.closest('a[href]')) {
@@ -686,7 +1229,21 @@ function maybeHandleZoomJoinButtonClick(event) {
 }
 
 // 5. Intercept External Links
+document.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) {
+        return;
+    }
+
+    if (maybeHandleSlackFileDownloadButtonClick(e)) {
+        return;
+    }
+}, true);
+
 document.addEventListener('click', (e) => {
+    if (maybeHandleSlackFileDownloadButtonClick(e)) {
+        return;
+    }
+
     if (maybeHandleZoomJoinButtonClick(e)) {
         return;
     }

@@ -4,37 +4,20 @@
 )]
 
 use std::{
+    env,
+    path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard,
     },
-    thread,
-    time::{Duration as StdDuration, Instant},
 };
 
-#[cfg(target_os = "macos")]
-use core::ffi::c_void;
-#[cfg(target_os = "macos")]
-use core_foundation::{
-    base::{CFTypeRef, TCFType},
-    dictionary::{CFDictionaryGetValueIfPresent, CFDictionaryRef},
-    number::{kCFNumberFloat64Type, kCFNumberSInt32Type, CFNumberGetValue, CFNumberRef},
-    string::CFString,
-};
-#[cfg(target_os = "macos")]
-use core_graphics::window::{
-    copy_window_info, kCGWindowAlpha, kCGWindowBounds, kCGWindowLayer,
-    kCGWindowListExcludeDesktopElements, kCGWindowListOptionIncludingWindow,
-    kCGWindowListOptionOnScreenAboveWindow, kCGWindowListOptionOnScreenOnly, kCGWindowNumber,
-    kCGWindowOwnerPID, CGWindowID,
-};
-#[cfg(target_os = "macos")]
-use objc2::{msg_send, runtime::AnyObject};
 use tauri::{
     menu::{Menu, MenuBuilder, MenuItem, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     utils::config::BackgroundThrottlingPolicy,
+    webview::{DownloadEvent, Webview},
     Manager, Theme, TitleBarStyle, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
     WindowEvent,
 };
@@ -45,17 +28,6 @@ use tauri_plugin_notification::NotificationExt;
 use tauri_winrt_notification::{Duration, Sound, Toast};
 
 const SLACK_URL: &str = "https://app.slack.com/client";
-const HIDDEN_MEMORY_SAVER_DELAY: StdDuration = StdDuration::from_secs(180);
-const OCCLUDED_MEMORY_SAVER_DELAY: StdDuration = StdDuration::from_secs(180);
-const MEMORY_SAVER_POLL_INTERVAL: StdDuration = StdDuration::from_secs(30);
-#[cfg(target_os = "macos")]
-const NS_WINDOW_OCCLUSION_STATE_VISIBLE: usize = 1 << 1;
-#[cfg(target_os = "macos")]
-const MATERIAL_VISIBILITY_SAMPLE_GRID_SIZE: usize = 12;
-#[cfg(target_os = "macos")]
-const MATERIAL_VISIBILITY_MIN_VISIBLE_RATIO: f64 = 0.10;
-#[cfg(target_os = "macos")]
-const MATERIAL_VISIBILITY_BLOCKER_ALPHA_THRESHOLD: f64 = 0.05;
 const SHORTCUT_ACTIONS_JS: &str = include_str!("../shortcut_actions.js");
 const SLACK_ACTION_SHORTCUTS: &[(&str, &str, &str)] = &[
     ("zlack_file_new_message", "New Message", "CmdOrCtrl+N"),
@@ -79,13 +51,7 @@ const SLACK_ACTION_SHORTCUTS: &[(&str, &str, &str)] = &[
     ("zlack_go_history_back", "Back", "CmdOrCtrl+["),
     ("zlack_go_history_forward", "Forward", "CmdOrCtrl+]"),
 ];
-#[derive(Default)]
-struct MemorySaverState {
-    generation: u64,
-    armed: bool,
-}
-
-type SharedMemorySaverState = Arc<Mutex<MemorySaverState>>;
+static LAST_DOWNLOAD_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 fn is_slack_url(url: &Url) -> bool {
     matches!(url.host_str(), Some("slack.com") | Some("app.slack.com"))
@@ -101,6 +67,10 @@ fn is_zoom_url(url: &Url) -> bool {
                 || url
                     .host_str()
                     .is_some_and(|host| host.ends_with(".zoom.us") || host.ends_with(".zoom.com"))))
+}
+
+fn is_open_downloads_url(url: &Url) -> bool {
+    url.scheme() == "zlack" && url.host_str() == Some("open-downloads")
 }
 
 fn is_allowed_external_url(url: &str) -> bool {
@@ -149,6 +119,142 @@ fn open_external_url_with_os(url: &str) -> Result<(), String> {
 #[tauri::command]
 fn open_external_url(url: String) -> Result<(), String> {
     open_external_url_with_os(&url)
+}
+
+fn downloads_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join("Downloads"))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        env::var_os("HOME").map(|home| PathBuf::from(home).join("Downloads"))
+    }
+}
+
+fn lock_last_download_path() -> MutexGuard<'static, Option<PathBuf>> {
+    match LAST_DOWNLOAD_PATH.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            eprintln!("Zlack: Last download path lock poisoned; continuing");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn remember_download_path(path: Option<&Path>) {
+    let mut last_download_path = lock_last_download_path();
+    *last_download_path = path.map(Path::to_path_buf);
+}
+
+fn remembered_download_path() -> Option<PathBuf> {
+    lock_last_download_path().clone()
+}
+
+fn revealable_download_file(downloads_dir: &Path) -> Option<PathBuf> {
+    let candidate = remembered_download_path()?.canonicalize().ok()?;
+    if !candidate.is_file() {
+        return None;
+    }
+
+    let downloads_dir = downloads_dir.canonicalize().ok()?;
+    if candidate.starts_with(&downloads_dir) {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn open_downloads_folder_with_os() -> Result<(), String> {
+    let downloads_dir =
+        downloads_dir().ok_or_else(|| "failed to resolve Downloads folder".to_string())?;
+
+    if !downloads_dir.is_dir() {
+        return Err(format!(
+            "Downloads folder does not exist: {}",
+            downloads_dir.display()
+        ));
+    }
+
+    let reveal_file = revealable_download_file(&downloads_dir);
+
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        if let Some(file) = &reveal_file {
+            let mut command = Command::new("/usr/bin/osascript");
+            command.args([
+                "-e",
+                "on run argv",
+                "-e",
+                "tell application \"Finder\"",
+                "-e",
+                "reveal (POSIX file (item 1 of argv) as alias)",
+                "-e",
+                "activate",
+                "-e",
+                "end tell",
+                "-e",
+                "end run",
+            ]);
+            command.arg(file);
+            command
+        } else {
+            let mut command = Command::new("/usr/bin/open");
+            command.args(["-a", "Finder"]);
+            command.arg(&downloads_dir);
+            command
+        }
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("explorer");
+        if let Some(file) = &reveal_file {
+            command.arg(format!("/select,{}", file.display()));
+        } else {
+            command.arg(&downloads_dir);
+        }
+        command
+    };
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(
+            reveal_file
+                .as_deref()
+                .and_then(Path::parent)
+                .unwrap_or(downloads_dir.as_path()),
+        );
+        command
+    };
+
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to open Downloads folder: {error}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "failed to open Downloads folder: status={}; stderr={}",
+            output.status, stderr
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("/usr/bin/osascript")
+            .args(["-e", "tell application \"Finder\" to activate"])
+            .status();
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn open_downloads_folder() -> Result<(), String> {
+    open_downloads_folder_with_os()
 }
 
 #[tauri::command]
@@ -354,11 +460,6 @@ fn install_app_menu(app: &mut tauri::App) -> tauri::Result<()> {
                             error
                         );
                     }
-                    schedule_memory_saver_destroy_after(
-                        app_handle.clone(),
-                        HIDDEN_MEMORY_SAVER_DELAY,
-                        true,
-                    );
                 }
             }
             "zlack_file_show_main" => restore_or_create_main_window(app_handle),
@@ -396,8 +497,6 @@ fn restore_window(window: &WebviewWindow) {
 }
 
 fn restore_or_create_main_window(app: &tauri::AppHandle) {
-    cancel_memory_saver_destroy(app);
-
     if let Some(window) = app.get_webview_window("main") {
         restore_window(&window);
         return;
@@ -406,6 +505,185 @@ fn restore_or_create_main_window(app: &tauri::AppHandle) {
     match create_main_window(app) {
         Ok(window) => restore_window(&window),
         Err(e) => eprintln!("Zlack: Failed to create main window: {}", e),
+    }
+}
+
+fn js_string_literal(value: &str) -> String {
+    let mut output = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '\\' => output.push_str("\\\\"),
+            '"' => output.push_str("\\\""),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character if character < ' ' => {
+                output.push_str(&format!("\\u{:04x}", character as u32));
+            }
+            character => output.push(character),
+        }
+    }
+    output.push('"');
+    output
+}
+
+fn filename_from_download(url: &Url, path: Option<&Path>) -> String {
+    if let Some(filename) = path
+        .and_then(Path::file_name)
+        .map(|filename| filename.to_string_lossy().into_owned())
+        .filter(|filename| !filename.is_empty())
+    {
+        return filename;
+    }
+
+    url.path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or("file")
+        .to_string()
+}
+
+fn show_download_toast(window: &Webview, filename: &str, url: &Url, status: &str, success: bool) {
+    let js = format!(
+        r#"
+        (() => {{
+            if (typeof window.__zlackShowDownloadToast !== 'function') {{
+                window.__zlackShowDownloadToast = (payload) => {{
+                    const filename = payload?.filename || 'file';
+                    const complete = payload?.status === 'finished';
+                    const success = payload?.success !== false;
+                    const ext = String(filename).split('.').pop()?.toLowerCase() || '';
+                    const kindMap = {{ pdf: 'PDF', png: 'PNG image', jpg: 'JPEG image', jpeg: 'JPEG image', gif: 'GIF image', zip: 'Archive', json: 'JSON' }};
+                    const kind = complete ? (success ? (kindMap[ext] || (ext ? ext.toUpperCase() : 'File')) : 'Download failed') : (kindMap[ext] || (ext ? ext.toUpperCase() : 'File'));
+                    const iconText = ext === 'pdf' ? 'PDF' : (['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext) ? 'IMG' : (ext ? ext.slice(0, 3).toUpperCase() : '01'));
+
+                    document.getElementById('zlack-download-toast')?.remove();
+                    const toast = document.createElement('div');
+                    toast.id = 'zlack-download-toast';
+                    toast.setAttribute('role', 'status');
+                    toast.setAttribute('aria-live', 'polite');
+	                    Object.assign(toast.style, {{
+	                        position: 'fixed',
+	                        right: '28px',
+	                        bottom: '84px',
+	                        width: 'min(380px, calc(100vw - 56px))',
+	                        zIndex: '2147483647',
+	                        pointerEvents: 'none',
+	                        color: '#f8f8f8',
+                        fontFamily: 'Slack-Lato, Slack-Averta, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+                    }});
+
+                    const panel = document.createElement('div');
+	                    Object.assign(panel.style, {{
+	                        boxSizing: 'border-box',
+	                        width: '100%',
+	                        padding: '12px 14px 14px',
+	                        border: '1px solid rgba(232, 232, 232, .14)',
+	                        borderRadius: '13px',
+	                        background: 'rgba(35, 38, 42, .76)',
+	                        boxShadow: '0 14px 36px rgba(0, 0, 0, .32), inset 0 1px 0 rgba(255, 255, 255, .045)',
+	                        backdropFilter: 'blur(18px) saturate(1.12)',
+	                        WebkitBackdropFilter: 'blur(18px) saturate(1.12)',
+	                    }});
+
+	                    const card = document.createElement('div');
+	                    Object.assign(card.style, {{
+	                        display: 'grid',
+	                        gridTemplateColumns: '42px minmax(0, 1fr)',
+	                        alignItems: 'center',
+	                        gap: '12px',
+	                        minHeight: '56px',
+	                        width: '100%',
+	                        padding: '8px 12px',
+	                        borderRadius: '10px',
+	                        background: 'rgba(28, 24, 25, .88)',
+	                    }});
+
+                    const icon = document.createElement('div');
+                    icon.textContent = iconText;
+                    Object.assign(icon.style, {{
+	                        position: 'relative',
+	                        display: 'grid',
+	                        placeItems: 'center',
+	                        width: '42px',
+	                        height: '42px',
+	                        borderRadius: '9px',
+	                        background: ext === 'pdf' ? 'linear-gradient(145deg, #ff2d6f, #df1457)' : 'linear-gradient(145deg, #6c6a6d, #4e4c50)',
+	                        color: '#fff',
+	                        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+	                        fontSize: ext === 'pdf' ? '11px' : '13px',
+	                        fontWeight: '800',
+	                        letterSpacing: '-.04em',
+	                    }});
+
+                    const badge = document.createElement('div');
+                    badge.textContent = complete ? (success ? '✓' : '!') : '↓';
+	                    Object.assign(badge.style, {{
+	                        position: 'absolute',
+	                        right: '-5px',
+	                        bottom: '-5px',
+	                        display: 'grid',
+	                        placeItems: 'center',
+	                        width: '19px',
+	                        height: '19px',
+	                        borderRadius: '999px',
+	                        background: '#f8f8f8',
+	                        color: success ? '#1d1c1d' : '#e01e5a',
+	                        border: '2px solid rgba(28, 24, 25, .95)',
+	                        fontSize: '12px',
+	                        fontWeight: '900',
+	                    }});
+                    icon.appendChild(badge);
+
+                    const copy = document.createElement('div');
+                    copy.style.minWidth = '0';
+	                    const title = document.createElement('div');
+	                    title.textContent = filename;
+	                    Object.assign(title.style, {{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '14px', lineHeight: '18px', fontWeight: '700', color: '#fff' }});
+	                    const subtitle = document.createElement('div');
+	                    subtitle.textContent = kind;
+	                    Object.assign(subtitle.style, {{ marginTop: '3px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: '13px', lineHeight: '17px', fontWeight: '500', color: 'rgba(255, 255, 255, .88)' }});
+	                    copy.append(title, subtitle);
+	                    card.append(icon, copy);
+
+	                    const downloads = document.createElement('button');
+	                    downloads.type = 'button';
+	                    downloads.textContent = 'View all downloads';
+	                    Object.assign(downloads.style, {{ pointerEvents: 'auto', margin: '9px 0 0 54px', padding: '0', border: '0', background: 'transparent', color: 'rgba(255, 255, 255, .94)', font: 'inherit', fontSize: '13px', lineHeight: '18px', fontWeight: '500', textAlign: 'left', cursor: 'pointer' }});
+	                    downloads.addEventListener('click', (event) => {{
+	                        event.preventDefault();
+	                        event.stopImmediatePropagation();
+	                        window.location.href = 'zlack://open-downloads?source=native-toast&ts=' + Date.now();
+	                        const invoke = window.__TAURI__?.core?.invoke || window.__TAURI__?.invoke || window.__TAURI_INTERNALS__?.invoke;
+	                        if (typeof invoke === 'function') {{
+	                            invoke('open_downloads_folder', {{}}).catch((error) => console.error('Zlack: Failed to open Downloads folder', error));
+	                        }}
+	                    }});
+
+                    panel.append(card, downloads);
+                    toast.append(panel);
+                    document.documentElement.appendChild(toast);
+                    window.clearTimeout(window.__zlackDownloadToastTimeout);
+                    window.__zlackDownloadToastTimeout = window.setTimeout(() => toast.remove(), complete ? 7000 : 5000);
+                }};
+            }}
+
+            window.__zlackShowDownloadToast({{
+                filename: {filename},
+                url: {url},
+                status: {status},
+                success: {success},
+            }});
+        }})();
+        "#,
+        filename = js_string_literal(filename),
+        url = js_string_literal(url.as_str()),
+        status = js_string_literal(status),
+        success = success,
+    );
+
+    if let Err(error) = window.eval(&js) {
+        eprintln!("Zlack: Failed to show download toast: {error}");
     }
 }
 
@@ -426,11 +704,18 @@ fn create_main_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> {
     .theme(Some(Theme::Dark))
     .title_bar_style(TitleBarStyle::Overlay)
     .hidden_title(true)
-    .background_throttling(BackgroundThrottlingPolicy::Suspend)
+    .background_throttling(BackgroundThrottlingPolicy::Throttle)
     .inner_size(1200.0, 800.0)
     .resizable(true)
     .initialization_script(include_str!("../preload.js"))
     .on_navigation(|url| {
+        if is_open_downloads_url(url) {
+            if let Err(error) = open_downloads_folder_with_os() {
+                eprintln!("Zlack: Failed to open Downloads folder from navigation: {error}");
+            }
+            return false;
+        }
+
         if is_zoom_url(url) {
             if let Err(error) = open_external_url_with_os(url.as_str()) {
                 eprintln!("Zlack: Failed to open Zoom navigation externally: {error}");
@@ -441,6 +726,13 @@ fn create_main_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> {
         true
     })
     .on_new_window(|url, _features| {
+        if is_open_downloads_url(&url) {
+            if let Err(error) = open_downloads_folder_with_os() {
+                eprintln!("Zlack: Failed to open Downloads folder from new-window: {error}");
+            }
+            return tauri::webview::NewWindowResponse::Deny;
+        }
+
         if !is_slack_url(&url) {
             if let Err(error) = open_external_url_with_os(url.as_str()) {
                 eprintln!("Zlack: Failed to open new-window URL externally: {error}");
@@ -450,535 +742,56 @@ fn create_main_window(app: &tauri::AppHandle) -> tauri::Result<WebviewWindow> {
 
         tauri::webview::NewWindowResponse::Allow
     })
+    .on_download(|window, event| {
+        match event {
+            DownloadEvent::Requested { url, destination } => {
+                let filename = filename_from_download(&url, Some(destination.as_path()));
+                eprintln!(
+                    "Zlack: download requested: {url}; destination={}",
+                    destination.display()
+                );
+                remember_download_path(Some(destination.as_path()));
+                show_download_toast(&window, &filename, &url, "downloading", true);
+            }
+            DownloadEvent::Finished { url, path, success } => {
+                let display_path = if success {
+                    path.clone().or_else(remembered_download_path)
+                } else {
+                    path.clone()
+                };
+                let filename = filename_from_download(&url, display_path.as_deref());
+                eprintln!(
+                    "Zlack: download finished: {url}; success={success}; path={}",
+                    display_path
+                        .as_deref()
+                        .map(Path::display)
+                        .map(|path| path.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                );
+                if success {
+                    if let Some(path) = path.as_deref() {
+                        remember_download_path(Some(path));
+                    }
+                } else {
+                    remember_download_path(None);
+                }
+                show_download_toast(&window, &filename, &url, "finished", success);
+            }
+            _ => {}
+        }
+
+        true
+    })
     .disable_drag_drop_handler()
     .build()?;
 
     Ok(window)
 }
 
-fn destroy_window(window: &WebviewWindow) {
-    if let Err(e) = window.destroy() {
-        eprintln!("Zlack: Failed to destroy main window: {}", e);
-    }
-}
-
-fn lock_memory_saver_state(state: &SharedMemorySaverState) -> MutexGuard<'_, MemorySaverState> {
-    match state.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => {
-            eprintln!("Zlack: Memory saver state lock poisoned; continuing");
-            poisoned.into_inner()
-        }
-    }
-}
-
-fn shared_memory_saver_state(app: &tauri::AppHandle) -> SharedMemorySaverState {
-    Arc::clone(app.state::<SharedMemorySaverState>().inner())
-}
-
-fn cancel_memory_saver_destroy(app: &tauri::AppHandle) {
-    let state = shared_memory_saver_state(app);
-    let mut state = lock_memory_saver_state(&state);
-    state.generation = state.generation.wrapping_add(1);
-    state.armed = false;
-}
-
-fn is_window_effectively_visible(window: &WebviewWindow) -> bool {
-    match window.is_visible() {
-        Ok(true) => {}
-        Ok(false) => return false,
-        Err(e) => {
-            eprintln!("Zlack: Failed to check window visibility: {}", e);
-            return true;
-        }
-    }
-
-    match window.is_minimized() {
-        Ok(true) => return false,
-        Ok(false) => {}
-        Err(e) => {
-            eprintln!("Zlack: Failed to check window minimized state: {}", e);
-            return true;
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        is_macos_window_occlusion_visible(window)
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        true
-    }
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Clone, Copy)]
-struct MacosWindowBounds {
-    x: f64,
-    y: f64,
-    width: f64,
-    height: f64,
-}
-
-#[cfg(target_os = "macos")]
-impl MacosWindowBounds {
-    fn contains_point(&self, x: f64, y: f64) -> bool {
-        x >= self.x && x <= self.x + self.width && y >= self.y && y <= self.y + self.height
-    }
-
-    fn is_material(&self) -> bool {
-        self.width > 1.0 && self.height > 1.0
-    }
-}
-
-#[cfg(target_os = "macos")]
-struct MacosWindowListEntry {
-    window_number: CGWindowID,
-    owner_pid: Option<i32>,
-    layer: i32,
-    alpha: f64,
-    bounds: Option<MacosWindowBounds>,
-}
-
-#[cfg(target_os = "macos")]
-fn is_macos_window_occlusion_visible(window: &WebviewWindow) -> bool {
-    let ns_window = match window.ns_window() {
-        Ok(ns_window) if !ns_window.is_null() => ns_window,
-        Ok(_) => return true,
-        Err(e) => {
-            eprintln!("Zlack: Failed to get NSWindow handle: {}", e);
-            return true;
-        }
-    };
-
-    // SAFETY: `ns_window` is the live NSWindow pointer returned by Tauri on the main thread.
-    let occlusion_state: usize = unsafe { msg_send![ns_window as *mut AnyObject, occlusionState] };
-    if (occlusion_state & NS_WINDOW_OCCLUSION_STATE_VISIBLE) == 0 {
-        return false;
-    }
-
-    // SAFETY: `windowNumber` is an Objective-C getter on a valid NSWindow and returns an NSInteger.
-    let window_number: isize = unsafe { msg_send![ns_window as *mut AnyObject, windowNumber] };
-    let Ok(window_number) = CGWindowID::try_from(window_number) else {
-        return true;
-    };
-
-    match is_macos_window_materially_visible_by_window_list(window_number) {
-        Some(true) => true,
-        Some(false) => {
-            eprintln!("Zlack: Window list coverage indicates main window is covered");
-            false
-        }
-        None => true,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn is_macos_window_materially_visible_by_window_list(window_number: CGWindowID) -> Option<bool> {
-    let target_windows = copy_window_info(kCGWindowListOptionIncludingWindow, window_number);
-    let target_bounds = target_windows.as_ref().and_then(|windows| {
-        windows
-            .get_all_values()
-            .into_iter()
-            .filter_map(macos_window_list_entry)
-            .find(|entry| entry.window_number == window_number)
-            .and_then(|entry| entry.bounds)
-    });
-
-    if let Some(target_bounds) = target_bounds {
-        if let Some(blocker_windows) = copy_window_info(
-            kCGWindowListOptionOnScreenAboveWindow | kCGWindowListExcludeDesktopElements,
-            window_number,
-        ) {
-            let blocker_bounds = blocker_windows
-                .get_all_values()
-                .into_iter()
-                .filter_map(macos_window_list_entry)
-                .filter(|entry| {
-                    entry.layer == 0 && entry.alpha > MATERIAL_VISIBILITY_BLOCKER_ALPHA_THRESHOLD
-                })
-                .filter_map(|entry| entry.bounds)
-                .filter(|bounds| bounds.is_material())
-                .collect::<Vec<_>>();
-
-            let visible_ratio = macos_bounds_material_visible_ratio(target_bounds, &blocker_bounds);
-            let is_visible = visible_ratio >= MATERIAL_VISIBILITY_MIN_VISIBLE_RATIO;
-            eprintln!(
-                "Zlack: Window list target matched by window number; visible ratio {:.2}",
-                visible_ratio
-            );
-            if !is_visible {
-                eprintln!(
-                    "Zlack: Window list coverage indicates main window is covered by {} blocker windows",
-                    blocker_bounds.len()
-                );
-            }
-
-            return Some(is_visible);
-        }
-    }
-
-    is_macos_window_materially_visible_by_full_window_list(window_number)
-}
-
-#[cfg(target_os = "macos")]
-fn is_macos_window_materially_visible_by_full_window_list(
-    window_number: CGWindowID,
-) -> Option<bool> {
-    let current_pid = std::process::id() as i32;
-    let windows = copy_window_info(
-        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
-        0,
-    )?;
-    let entries = windows
-        .get_all_values()
-        .into_iter()
-        .filter_map(macos_window_list_entry)
-        .collect::<Vec<_>>();
-
-    let mut target_index = entries
-        .iter()
-        .position(|entry| entry.window_number == window_number && entry.bounds.is_some());
-    let mut target_source = "window number";
-
-    if target_index.is_none() {
-        target_index = entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| {
-                entry.owner_pid == Some(current_pid)
-                    && entry.layer == 0
-                    && entry
-                        .bounds
-                        .as_ref()
-                        .is_some_and(MacosWindowBounds::is_material)
-            })
-            .max_by(|(_, left), (_, right)| {
-                let left_area = left
-                    .bounds
-                    .as_ref()
-                    .map(macos_window_bounds_area)
-                    .unwrap_or(0.0);
-                let right_area = right
-                    .bounds
-                    .as_ref()
-                    .map(macos_window_bounds_area)
-                    .unwrap_or(0.0);
-                left_area.total_cmp(&right_area)
-            })
-            .map(|(index, _)| index);
-        target_source = "owner pid";
-    }
-
-    let target_index = target_index?;
-    let target_bounds = entries[target_index].bounds?;
-    if !target_bounds.is_material() {
-        return None;
-    }
-
-    let blocker_bounds = entries[..target_index]
-        .iter()
-        .filter(|entry| {
-            entry.layer == 0 && entry.alpha > MATERIAL_VISIBILITY_BLOCKER_ALPHA_THRESHOLD
-        })
-        .filter_map(|entry| entry.bounds)
-        .filter(MacosWindowBounds::is_material)
-        .collect::<Vec<_>>();
-
-    let visible_ratio = macos_bounds_material_visible_ratio(target_bounds, &blocker_bounds);
-    let is_visible = visible_ratio >= MATERIAL_VISIBILITY_MIN_VISIBLE_RATIO;
-    eprintln!(
-        "Zlack: Full window list target matched by {}; visible ratio {:.2}",
-        target_source, visible_ratio
-    );
-    if !is_visible {
-        eprintln!(
-            "Zlack: Full window list coverage indicates main window is covered by {} blocker windows",
-            blocker_bounds.len()
-        );
-    }
-
-    Some(is_visible)
-}
-
-#[cfg(target_os = "macos")]
-fn macos_bounds_material_visible_ratio(
-    target_bounds: MacosWindowBounds,
-    blocker_bounds: &[MacosWindowBounds],
-) -> f64 {
-    if !target_bounds.is_material() {
-        return 1.0;
-    }
-
-    let grid_size = MATERIAL_VISIBILITY_SAMPLE_GRID_SIZE;
-    let total_samples = grid_size * grid_size;
-    let mut visible_samples = 0;
-
-    for row in 0..grid_size {
-        let y = target_bounds.y + target_bounds.height * (row as f64 + 0.5) / grid_size as f64;
-        for column in 0..grid_size {
-            let x =
-                target_bounds.x + target_bounds.width * (column as f64 + 0.5) / grid_size as f64;
-            if !blocker_bounds
-                .iter()
-                .any(|bounds| bounds.contains_point(x, y))
-            {
-                visible_samples += 1;
-            }
-        }
-    }
-
-    visible_samples as f64 / total_samples as f64
-}
-
-#[cfg(target_os = "macos")]
-fn macos_window_bounds_area(bounds: &MacosWindowBounds) -> f64 {
-    bounds.width * bounds.height
-}
-
-#[cfg(target_os = "macos")]
-fn macos_window_list_entry(raw_window: *const c_void) -> Option<MacosWindowListEntry> {
-    let dictionary = raw_window as CFDictionaryRef;
-    if dictionary.is_null() {
-        return None;
-    }
-
-    let window_number = cg_window_number(dictionary)?;
-    Some(MacosWindowListEntry {
-        window_number,
-        owner_pid: cg_window_i32(dictionary, cg_window_owner_pid_key()),
-        layer: cg_window_i32(dictionary, cg_window_layer_key()).unwrap_or(0),
-        alpha: cg_window_f64(dictionary, cg_window_alpha_key()).unwrap_or(1.0),
-        bounds: cg_window_bounds(dictionary),
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn cg_window_number_key() -> CFTypeRef {
-    // SAFETY: CoreGraphics exports this immutable CFString key for window-list dictionaries.
-    unsafe { kCGWindowNumber.cast::<c_void>() }
-}
-
-#[cfg(target_os = "macos")]
-fn cg_window_layer_key() -> CFTypeRef {
-    // SAFETY: CoreGraphics exports this immutable CFString key for window-list dictionaries.
-    unsafe { kCGWindowLayer.cast::<c_void>() }
-}
-
-#[cfg(target_os = "macos")]
-fn cg_window_alpha_key() -> CFTypeRef {
-    // SAFETY: CoreGraphics exports this immutable CFString key for window-list dictionaries.
-    unsafe { kCGWindowAlpha.cast::<c_void>() }
-}
-
-#[cfg(target_os = "macos")]
-fn cg_window_owner_pid_key() -> CFTypeRef {
-    // SAFETY: CoreGraphics exports this immutable CFString key for window-list dictionaries.
-    unsafe { kCGWindowOwnerPID.cast::<c_void>() }
-}
-
-#[cfg(target_os = "macos")]
-fn cg_window_bounds_key() -> CFTypeRef {
-    // SAFETY: CoreGraphics exports this immutable CFString key for window-list dictionaries.
-    unsafe { kCGWindowBounds.cast::<c_void>() }
-}
-
-#[cfg(target_os = "macos")]
-fn cg_window_number(dictionary: CFDictionaryRef) -> Option<CGWindowID> {
-    let raw_number = cg_window_i32(dictionary, cg_window_number_key())?;
-    CGWindowID::try_from(raw_number).ok()
-}
-
-#[cfg(target_os = "macos")]
-fn cg_window_bounds(dictionary: CFDictionaryRef) -> Option<MacosWindowBounds> {
-    let bounds_dictionary =
-        cg_dictionary_value(dictionary, cg_window_bounds_key())? as CFDictionaryRef;
-    Some(MacosWindowBounds {
-        x: cg_bounds_value(bounds_dictionary, "X")?,
-        y: cg_bounds_value(bounds_dictionary, "Y")?,
-        width: cg_bounds_value(bounds_dictionary, "Width")?,
-        height: cg_bounds_value(bounds_dictionary, "Height")?,
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn cg_bounds_value(dictionary: CFDictionaryRef, key: &str) -> Option<f64> {
-    let key = CFString::new(key);
-    cg_dictionary_number_value(dictionary, key.as_CFTypeRef()).and_then(cf_number_to_f64)
-}
-
-#[cfg(target_os = "macos")]
-fn cg_window_i32(dictionary: CFDictionaryRef, key: CFTypeRef) -> Option<i32> {
-    cg_dictionary_number_value(dictionary, key).and_then(cf_number_to_i32)
-}
-
-#[cfg(target_os = "macos")]
-fn cg_window_f64(dictionary: CFDictionaryRef, key: CFTypeRef) -> Option<f64> {
-    cg_dictionary_number_value(dictionary, key).and_then(cf_number_to_f64)
-}
-
-#[cfg(target_os = "macos")]
-fn cg_dictionary_number_value(dictionary: CFDictionaryRef, key: CFTypeRef) -> Option<CFNumberRef> {
-    cg_dictionary_value(dictionary, key).map(|value| value as CFNumberRef)
-}
-
-#[cfg(target_os = "macos")]
-fn cg_dictionary_value(dictionary: CFDictionaryRef, key: CFTypeRef) -> Option<CFTypeRef> {
-    let mut value = std::ptr::null();
-    // SAFETY: CoreGraphics provides immutable dictionaries and static CFString keys; output is checked.
-    let found =
-        unsafe { CFDictionaryGetValueIfPresent(dictionary, key.cast::<c_void>(), &mut value) };
-
-    if found == 0 || value.is_null() {
-        None
-    } else {
-        Some(value as CFTypeRef)
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn cf_number_to_i32(number: CFNumberRef) -> Option<i32> {
-    let mut value = 0;
-    // SAFETY: `value` points to valid writable storage for the requested CFNumber type.
-    let ok = unsafe {
-        CFNumberGetValue(
-            number,
-            kCFNumberSInt32Type,
-            (&mut value as *mut i32).cast::<c_void>(),
-        )
-    };
-    ok.then_some(value)
-}
-
-#[cfg(target_os = "macos")]
-fn cf_number_to_f64(number: CFNumberRef) -> Option<f64> {
-    let mut value = 0.0;
-    // SAFETY: `value` points to valid writable storage for the requested CFNumber type.
-    let ok = unsafe {
-        CFNumberGetValue(
-            number,
-            kCFNumberFloat64Type,
-            (&mut value as *mut f64).cast::<c_void>(),
-        )
-    };
-    ok.then_some(value)
-}
-
-fn schedule_memory_saver_destroy_after(
-    app: tauri::AppHandle,
-    delay: StdDuration,
-    require_not_visible: bool,
-) {
-    let state = shared_memory_saver_state(&app);
-    let scheduled_generation = {
-        let mut state = lock_memory_saver_state(&state);
-        state.generation = state.generation.wrapping_add(1);
-        state.armed = true;
-        state.generation
-    };
-
-    thread::spawn(move || {
-        thread::sleep(delay);
-
-        let should_destroy = {
-            let mut state = lock_memory_saver_state(&state);
-            if !state.armed || state.generation != scheduled_generation {
-                false
-            } else {
-                state.armed = false;
-                true
-            }
-        };
-
-        if !should_destroy {
-            return;
-        }
-
-        let app_for_main_thread = app.clone();
-        if let Err(e) = app.run_on_main_thread(move || {
-            if let Some(window) = app_for_main_thread.get_webview_window("main") {
-                if require_not_visible && is_window_effectively_visible(&window) {
-                    return;
-                }
-
-                destroy_window(&window);
-            }
-        }) {
-            eprintln!("Zlack: Failed to schedule memory saver destroy: {}", e);
-        }
-    });
-}
-
-fn start_memory_saver_visibility_monitor(app: tauri::AppHandle) {
-    thread::spawn(move || {
-        let mut invisible_since: Option<Instant> = None;
-
-        loop {
-            thread::sleep(MEMORY_SAVER_POLL_INTERVAL);
-
-            let (tx, rx) = mpsc::channel();
-            let app_for_check = app.clone();
-            if let Err(e) = app.run_on_main_thread(move || {
-                let visibility = app_for_check
-                    .get_webview_window("main")
-                    .map(|window| is_window_effectively_visible(&window));
-                let _ = tx.send(visibility);
-            }) {
-                eprintln!(
-                    "Zlack: Failed to schedule memory saver visibility check: {}",
-                    e
-                );
-                invisible_since = None;
-                continue;
-            }
-
-            match rx.recv() {
-                Ok(Some(true)) => {
-                    if invisible_since.take().is_some() {
-                        eprintln!("Zlack: Window effectively visible; clearing memory saver destroy timer");
-                    }
-                }
-                Ok(Some(false)) => {
-                    let since = invisible_since.get_or_insert_with(|| {
-                        eprintln!(
-                            "Zlack: Window not effectively visible; arming 3-minute destroy timer"
-                        );
-                        Instant::now()
-                    });
-
-                    if since.elapsed() >= OCCLUDED_MEMORY_SAVER_DELAY {
-                        let app_for_destroy = app.clone();
-                        if let Err(e) = app.run_on_main_thread(move || {
-                            if let Some(window) = app_for_destroy.get_webview_window("main") {
-                                if is_window_effectively_visible(&window) {
-                                    return;
-                                }
-
-                                eprintln!("Zlack: Destroying occluded webview after 3 minutes");
-                                destroy_window(&window);
-                            }
-                        }) {
-                            eprintln!("Zlack: Failed to schedule occluded webview destroy: {}", e);
-                        }
-                    }
-                }
-                Ok(None) | Err(_) => {
-                    invisible_since = None;
-                }
-            }
-        }
-    });
-}
-
 fn main() {
-    let memory_saver_state: SharedMemorySaverState =
-        Arc::new(Mutex::new(MemorySaverState::default()));
     let is_quitting = Arc::new(AtomicBool::new(false));
 
     tauri::Builder::default()
-        .manage(Arc::clone(&memory_saver_state))
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
@@ -1020,7 +833,6 @@ fn main() {
                     .build(app)?;
 
                 create_main_window(app.handle())?;
-                start_memory_saver_visibility_monitor(app.handle().clone());
                 Ok(())
             }
         })
@@ -1035,30 +847,6 @@ fn main() {
                     if let Err(e) = window.hide() {
                         eprintln!("Zlack: Failed to hide window before delayed destroy: {}", e);
                     }
-                    schedule_memory_saver_destroy_after(
-                        window.app_handle().clone(),
-                        HIDDEN_MEMORY_SAVER_DELAY,
-                        true,
-                    );
-                }
-                WindowEvent::Resized(_) => {
-                    if matches!(window.is_minimized(), Ok(true)) {
-                        schedule_memory_saver_destroy_after(
-                            window.app_handle().clone(),
-                            HIDDEN_MEMORY_SAVER_DELAY,
-                            true,
-                        );
-                    }
-                }
-                WindowEvent::Focused(false) => {
-                    schedule_memory_saver_destroy_after(
-                        window.app_handle().clone(),
-                        OCCLUDED_MEMORY_SAVER_DELAY,
-                        true,
-                    );
-                }
-                WindowEvent::Focused(true) => {
-                    cancel_memory_saver_destroy(window.app_handle());
                 }
                 _ => {}
             }
@@ -1066,6 +854,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             notify,
             open_external_url,
+            open_downloads_folder,
             start_window_drag,
             toggle_window_maximize
         ])
