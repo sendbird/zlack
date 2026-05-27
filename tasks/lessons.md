@@ -45,3 +45,28 @@
 
 - Do not destroy/recreate Slack WebView as a memory saver unless the user explicitly accepts reload cost; hidden/occluded unload causes expensive Slack reload and state loss.
 - Treat WebView lifecycle and WebView background throttling as separate controls: app-owned `destroy()` unloads the view, `Suspend` fully pauses background tasks, and `Throttle` only slows processing.
+
+## 2026-05-27 Slack download click-target narrowing
+
+- Do not let a generic “leftmost action” heuristic fire outside a verified file-card context; Slack header/avatar controls can otherwise be misclassified as download buttons.
+- For icon-only download controls, require nearby file-card evidence such as a real Slack file URL plus filename-like text before intercepting the click.
+
+## 2026-05-27 Download toast filename source
+
+- Do not show a preload fallback toast with `getFilenameFromUrl()` when a native download event will follow; URL-derived names can overwrite or visually mask the duplicate-safe filename selected by WebKit.
+- For saved-file UI, use the native download destination path as the source of truth, and treat JavaScript URL filenames only as a last-resort fallback.
+
+## 2026-05-27 Slack download permalink interception
+
+- Do not consume Slack's real download-button click just because a nearby Slack `/files/...` permalink exists; permalinks are often viewer routes, not binary downloads.
+- For capture-phase download fallbacks, require a direct Slack file/download URL and otherwise let Slack's own handler run so `window.open` and WebKit download hooks can catch the actual download target.
+
+## 2026-05-27 Global click interceptor safety
+
+- Do not use positional heuristics such as “leftmost action” in a capture-phase global click listener for Slack; false positives can swallow unrelated navigation controls like Home.
+- Prefer explicit control labels for capture-phase interception, and let Slack-owned handlers run unless the target is clearly the intended control.
+
+## 2026-05-27 Icon-only Slack download controls
+
+- Slack file download buttons can be icon-only without a stable accessible label in the clicked element path; removing all icon fallback can make the button inert again.
+- If an icon fallback is necessary, bind it to a small file-card container with filename text and a Slack file link, and never let it climb to whole-page ancestors.
