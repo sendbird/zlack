@@ -337,7 +337,18 @@
 - Changed background throttling from `Disabled` to `Throttle`, so a hidden/background WebView is slowed but not fully suspended or destroyed.
 - Remaining behavior: closing from the window/menu still hides the window; reopening restores the same WebView instead of reloading Slack.
 - Verification passed: `rtk cargo fmt --manifest-path src-tauri/Cargo.toml --check`, `rtk cargo check --manifest-path src-tauri/Cargo.toml`, and `rtk npm run tauri build`.
-- Installed rebuilt app to `/Applications/Zlack.app` and relaunched it.
+
+## 2026-05-27 Slack download header false-positive
+
+- [x] Reproduce/report that a non-file header/avatar click is being intercepted as download.
+- [x] Narrow icon-only download interception in `src-tauri/preload.js` so it only fires inside a verified file-card context.
+- [x] Verify in the running app that the people/avatar header no longer triggers download while real file download buttons still do.
+- [x] Installed rebuilt app to `/Applications/Zlack.app` and relaunched it.
+
+### Review / Results
+
+- Final bounded file-card fallback keeps avatar/header/Home clicks out of the download path while preserving the real icon-only file download button.
+- Runtime verification confirmed Home clicks did not create a new `OrbLoop+AMS` download, and the user confirmed the file download button works.
 
 ## 2026-05-22 Reliable external URL opener
 
@@ -475,3 +486,65 @@
 - Verification passed: `rtk cargo fmt --manifest-path src-tauri/Cargo.toml --check`, `rtk cargo check --manifest-path src-tauri/Cargo.toml`, and `rtk npm run tauri build`.
 - Installed rebuilt app to `/Applications/Zlack.app` and relaunched it.
 - Finder reveal command verified with a concrete file: Finder selection resolved to `/Users/jinku/Downloads/07242024-FSA.pdf`.
+
+## 2026-05-27 Download toast saved filename correction
+
+- [x] Re-check native Tauri/Wry download event behavior for saved filenames.
+- [x] Ask an independent advisor to inspect the native/preload toast paths.
+- [x] Identify that Rust already uses Wry's duplicate-safe `DownloadEvent::Requested.destination` and falls back to remembered destination on macOS `Finished.path = None`.
+- [x] Remove preload-side immediate URL-derived toast calls so the visible toast is authored by native download events with the actual saved destination filename.
+- [x] Validate JavaScript/Rust and reinstall rebuilt app.
+- [x] Manually verify a duplicate download toast shows the saved suffix filename.
+
+### Review / Results
+
+- Root cause: preload fallback clicks were still calling `showZlackDownloadToast()` with `getFilenameFromUrl(downloadUrl)`, so the user-visible toast could show the original URL filename even though native download events knew the saved duplicate-safe path.
+- Removed those preload-authored URL filename toasts; native `DownloadEvent::Requested` / `Finished` remains the toast source.
+- Verification passed: `rtk node --check src-tauri/preload.js`, `rtk cargo fmt --manifest-path src-tauri/Cargo.toml --check`, `rtk cargo check --manifest-path src-tauri/Cargo.toml`, and `rtk npm run tauri build`.
+- Installed rebuilt app to `/Applications/Zlack.app` and relaunched it.
+- Runtime verified with Peekaboo: downloading existing `OrbLoop+AMS.3mf` produced toast title `OrbLoop+AMS (27).3mf` and then `OrbLoop+AMS (28).3mf`; `View all downloads` opened Finder Downloads with `OrbLoop+AMS (28).3mf` visible/selected.
+
+## 2026-05-27 Download button regression after toast filename fix
+
+- [x] Re-evaluate download click routing after the user reported the button no longer works.
+- [x] Ask an independent advisor to inspect the regression path.
+- [x] Identify that the capture-phase fallback could consume Slack's real download click while selecting a nearby Slack `/files/...` permalink instead of a direct binary/download URL.
+- [x] Change direct fallback interception to require a direct Slack download URL; if only a permalink is nearby, let Slack's own click handler run and be caught by the existing `window.open` / native download hooks.
+- [x] Validate JavaScript/Rust and reinstall rebuilt app.
+- [x] Manually verify real download button clicks still create duplicate-safe saved files and toast.
+
+### Review / Results
+
+- Validation passed: `rtk node --check src-tauri/preload.js`, `rtk cargo check --manifest-path src-tauri/Cargo.toml`, and `rtk npm run tauri build`.
+- Installed rebuilt app to `/Applications/Zlack.app` and relaunched it.
+- Final manual verification completed after the bounded file-card fallback: Home and header/avatar clicks no longer trigger downloads, while the real file download button works and shows the saved duplicate-safe filename.
+
+## 2026-05-27 Global Slack click regression rollback
+
+- [x] Re-assess after the user reported broad Slack controls such as Home no longer work.
+- [x] Ask an independent advisor to identify the global click-break path.
+- [x] Remove the heuristic “leftmost file action” capture fallback entirely.
+- [x] Keep only explicit singular download-label interception (`Download`, Korean download/save labels), so normal Slack navigation like Home/Downloads is not swallowed.
+- [x] Restore nearby URL search for explicit download controls, matching the previously verified working path while avoiding generic control interception.
+- [x] Validate JavaScript/Rust, rebuild, reinstall, and manually verify Home plus download.
+
+### Review / Results
+
+- Validation passed: `rtk node --check src-tauri/preload.js`, `rtk cargo check --manifest-path src-tauri/Cargo.toml`, and `rtk npm run tauri build`.
+- Installed rebuilt app to `/Applications/Zlack.app` and relaunched it.
+- Runtime verified with Peekaboo that Home click now leaves search results and restores Slack Home/workspace navigation.
+- Follow-up showed icon-only file download controls have no reliable explicit label, so the download click was no longer intercepted after removing the positional fallback.
+
+## 2026-05-27 Bounded file-card download fallback
+
+- [x] Re-introduce icon-only download fallback only inside a bounded Slack file-card context.
+- [x] Stop before large app/page ancestors so global controls like Home cannot inherit unrelated file links from the page.
+- [x] Treat the leftmost-action heuristic as valid only within that bounded file-card element.
+- [x] Validate JavaScript/Rust, rebuild, reinstall, and manually verify Home plus download.
+
+### Review / Results
+
+- Validation passed: `rtk node --check src-tauri/preload.js`, `rtk cargo check --manifest-path src-tauri/Cargo.toml`, and `rtk npm run tauri build`.
+- Installed rebuilt app to `/Applications/Zlack.app` and relaunched it.
+- Runtime verified with Peekaboo that a Home click did not create a new duplicate download (`OrbLoop+AMS (30).3mf` before and after the click).
+- User confirmed the real file download button works after the bounded fallback patch.

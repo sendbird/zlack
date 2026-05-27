@@ -542,6 +542,29 @@ function isSlackFileUrl(url) {
             || url.pathname.startsWith('/files-tmb/'));
 }
 
+function isSlackFilePermalinkUrl(url) {
+    if (!url || !isSlackHost(url.hostname)) {
+        return false;
+    }
+
+    const pathname = url.pathname || '';
+    return pathname.startsWith('/files/')
+        && !pathname.includes('/download/')
+        && url.searchParams.get('download') !== '1';
+}
+
+function isDirectSlackDownloadUrl(url) {
+    if (!isSlackFileUrl(url) || isSlackFilePermalinkUrl(url)) {
+        return false;
+    }
+
+    const pathname = url.pathname || '';
+    return isSlackFileHost(url.hostname)
+        || pathname.startsWith('/files-pri/')
+        || pathname.includes('/download/')
+        || url.searchParams.get('download') === '1';
+}
+
 const ZOOM_EXTERNAL_PROTOCOLS = new Set(['zoommtg:', 'zoomus:', 'zoomphonecall:']);
 const originalWindowOpen = window.open.bind(window);
 
@@ -630,7 +653,6 @@ function handleWindowOpenUrl(href, fallbackTarget = '_blank', fallbackFeatures =
         const downloadUrl = normalizeSlackInternalUrl(url.toString());
         console.log('Zlack: Starting Slack file download in current webview:', downloadUrl);
         startWebviewDownload(downloadUrl);
-        showZlackDownloadToast({ filename: getFilenameFromUrl(downloadUrl), url: downloadUrl, status: 'downloading' });
         return true;
     }
 
@@ -779,6 +801,11 @@ function getControlDescriptor(element) {
     ].filter(Boolean).join(' ');
 }
 
+function isExplicitDownloadControl(element) {
+    const descriptor = getControlDescriptor(element);
+    return /\bdownload\b|다운로드|다운 받|다운받|저장/i.test(descriptor);
+}
+
 function isVisibleControl(element) {
     if (!element) return false;
     const rect = element.getBoundingClientRect();
@@ -787,11 +814,43 @@ function isVisibleControl(element) {
     return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0.01;
 }
 
-function isLeftmostFileActionControl(element) {
+function getBoundedSlackFileCardContext(element) {
+    let current = element;
+
+    for (let depth = 0; current && depth < 8; depth += 1) {
+        if (current === document.body || current === document.documentElement) {
+            return null;
+        }
+
+        const rect = current.getBoundingClientRect?.();
+        if (rect && (rect.width > Math.min(window.innerWidth * 0.75, 900) || rect.height > 360)) {
+            return null;
+        }
+
+        const links = Array.from(current.querySelectorAll?.('a[href]') || []);
+        const hasSlackFileLink = links.some((link) => isSlackFileUrl(parseUrl(link.href)));
+        if (hasSlackFileLink) {
+            const text = (current.innerText || current.textContent || '').slice(0, 4000);
+            if (/\.[a-z0-9]{2,8}(?:\b|$)/i.test(text)) {
+                return current;
+            }
+        }
+
+        current = current.parentElement;
+    }
+
+    return null;
+}
+
+function isLeftmostFileActionControl(element, boundaryElement) {
     const rect = element.getBoundingClientRect();
     let current = element.parentElement;
 
     for (let depth = 0; current && depth < 7; depth += 1) {
+        if (boundaryElement && !boundaryElement.contains(current)) {
+            return false;
+        }
+
         const controls = Array.from(current.querySelectorAll('a[href], button, [role="button"], [tabindex]:not([tabindex="-1"])'))
             .filter(isVisibleControl)
             .map((control) => ({ control, rect: control.getBoundingClientRect() }))
@@ -802,15 +861,14 @@ function isLeftmostFileActionControl(element) {
             return controls[0].control === element;
         }
 
+        if (current === boundaryElement) {
+            return false;
+        }
+
         current = current.parentElement;
     }
 
     return false;
-}
-
-function isLikelySlackDownloadControl(element) {
-    const descriptor = getControlDescriptor(element);
-    return /download|다운로드|다운 받|다운받|저장/i.test(descriptor) || isLeftmostFileActionControl(element);
 }
 
 function getSlackFileUrlPriority(url) {
@@ -828,30 +886,38 @@ function getSlackFileUrlPriority(url) {
     })();
     const isPdf = /\.pdf(?:$|[/?#])/i.test(decodedPathname);
 
-    if (isSlackHost(url.hostname) && pathname.startsWith('/files/')) {
-        return 50;
+    if (isDirectSlackDownloadUrl(url) && isPdf) {
+        return 80;
+    }
+
+    if (isDirectSlackDownloadUrl(url)) {
+        return 75;
     }
 
     if (isSlackFileHost(url.hostname) && isPdf) {
-        return 45;
+        return 70;
     }
 
     if (isSlackHost(url.hostname) && pathname.startsWith('/files-pri/')) {
-        return 35;
+        return 65;
     }
 
     if (isSlackFileHost(url.hostname)) {
-        return 30;
+        return 60;
     }
 
     if (isSlackHost(url.hostname) && pathname.startsWith('/files-tmb/')) {
         return 10;
     }
 
+    if (isSlackFilePermalinkUrl(url)) {
+        return 5;
+    }
+
     return 20;
 }
 
-function findSlackFileUrlNear(element) {
+function findSlackFileUrlNear(element, options = {}) {
     const seen = new Set();
     let bestCandidate = null;
     let current = element;
@@ -870,6 +936,10 @@ function findSlackFileUrlNear(element) {
             seen.add(link);
 
             const url = parseUrl(link.href);
+            if (options.directOnly && !isDirectSlackDownloadUrl(url)) {
+                continue;
+            }
+
             const priority = getSlackFileUrlPriority(url);
             if (priority >= 0 && (!bestCandidate || priority > bestCandidate.priority)) {
                 bestCandidate = {
@@ -1168,7 +1238,6 @@ function triggerSlackFileDownload(downloadUrl, event, sourceLabel) {
     event?.preventDefault();
     event?.stopImmediatePropagation();
     startWebviewDownload(downloadUrl);
-    showZlackDownloadToast({ filename: getFilenameFromUrl(downloadUrl), url: downloadUrl, status: 'downloading' });
     return true;
 }
 
@@ -1179,13 +1248,20 @@ function maybeHandleSlackFileDownloadButtonClick(event) {
     }
 
     const control = getClickableControl(event.target);
-    if (!control || !isLikelySlackDownloadControl(control)) {
+    if (!control) {
         return false;
     }
 
-    const downloadUrl = findSlackFileUrlNear(control);
+    const fileCardContext = getBoundedSlackFileCardContext(control);
+    const shouldHandle = isExplicitDownloadControl(control)
+        || (fileCardContext && isLeftmostFileActionControl(control, fileCardContext));
+    if (!shouldHandle) {
+        return false;
+    }
+
+    const downloadUrl = findSlackFileUrlNear(fileCardContext || control);
     if (!downloadUrl) {
-        console.warn('Zlack: Slack download control clicked, but no nearby file URL was found', control);
+        console.warn('Zlack: Slack download control clicked, but no nearby file URL was found; letting Slack handle it', control);
         return false;
     }
 
